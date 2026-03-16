@@ -1,4 +1,4 @@
-# PaperLab: OSCP 纸上推演靶场生成引擎
+# PaperLab: OSCP 纸上推演靶场
 
 > “纸上得来亦不浅，赛博沙盘定乾坤。”
 
