@@ -1,0 +1,454 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>OSCP 纸上推演训练系统</title>
+    <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Fira+Code:wght@400;500;700&display=swap');
+        
+        /* 核心极简配色体系 */
+        :root {
+            --bg-base: #0d1117;       
+            --bg-panel: #161b22;      
+            --bg-element: #21262d;    
+            --border-muted: #30363d;  
+            --oscp-green: #5cb85c;    
+            --oscp-green-dark: #3b533b;
+            --text-main: #c9d1d9;     
+            --text-muted: #8b949e;    
+        }
+
+        body { background-color: var(--bg-base); color: var(--text-main); font-family: 'Inter', sans-serif; overflow-x: hidden; }
+        .mono { font-family: 'Fira Code', monospace; }
+        
+        .glass-card { background-color: var(--bg-panel); border: 1px solid var(--border-muted); border-radius: 8px; }
+        
+        .pro-input { background-color: var(--bg-base); border: 1px solid var(--border-muted); color: var(--text-main); border-radius: 6px; transition: all 0.2s; }
+        .pro-input:focus { outline: none; border-color: var(--oscp-green); box-shadow: 0 0 0 1px var(--oscp-green); }
+        .pro-input:disabled { opacity: 0.7; cursor: not-allowed; }
+        
+        select.pro-input { appearance: none; background-image: url("data:image/svg+xml;charset=UTF-8,%3csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%238b949e' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3e%3cpolyline points='6 9 12 15 18 9'%3e%3c/polyline%3e%3c/svg%3e"); background-repeat: no-repeat; background-position: right 1rem center; background-size: 1em; }
+        
+        .pro-btn { background-color: var(--oscp-green-dark); color: #fff; font-weight: 600; border-radius: 6px; transition: all 0.2s; border: 1px solid transparent; }
+        .pro-btn:hover:not(:disabled) { background-color: var(--oscp-green); color: #0d1117; border-color: var(--oscp-green); }
+        .pro-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+        details summary { list-style: none; outline: none; user-select: none; }
+        details summary::-webkit-details-marker { display: none; }
+        .intel-details { border: 1px solid var(--border-muted); border-radius: 6px; overflow: hidden; background: var(--bg-panel); margin-bottom: 12px; }
+        .intel-summary { background: var(--bg-element); padding: 12px 16px; border-bottom: 1px solid transparent; transition: all 0.2s; }
+        .intel-details[open] .intel-summary { border-bottom-color: var(--border-muted); }
+        
+        .loading-overlay { background: rgba(13, 17, 23, 0.9); position: fixed; inset: 0; z-index: 9999; display: flex; flex-direction: column; align-items: center; justify-content: center; backdrop-filter: blur(4px); }
+        .spinner { width: 40px; height: 40px; border: 3px solid var(--border-muted); border-top-color: var(--oscp-green); border-radius: 50%; animation: spin 1s linear infinite; }
+        @keyframes spin { to { transform: rotate(360deg); } }
+
+        .fade-enter-active, .fade-leave-active { transition: opacity 0.4s ease, transform 0.4s ease; }
+        .fade-enter-from, .fade-leave-to { opacity: 0; transform: translateY(10px); }
+        
+        ::-webkit-scrollbar { width: 6px; height: 6px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background: var(--border-muted); border-radius: 3px; }
+        ::-webkit-scrollbar-thumb:hover { background: #484f58; }
+        .custom-scroll { padding-right: 4px; }
+
+        /* ==========================================
+           幽灵终端页脚样式 (Ghost Footer)
+           ========================================== */
+        .cyber-footer {
+            margin-top: auto; 
+            padding: 40px 0 20px 0;
+            background-color: transparent;
+            text-align: center;
+            font-family: 'Fira Code', monospace; 
+            width: 100%;
+            opacity: 0.35; /* 极度暗淡，融入背景 */
+            transition: opacity 0.4s ease;
+        }
+
+        .cyber-footer:hover {
+            opacity: 1; /* 鼠标进入瞬间点亮 */
+        }
+
+        .footer-content { 
+            display: flex; 
+            flex-direction: column; 
+            gap: 8px; 
+        }
+
+        .terminal-text { 
+            font-size: 11px; 
+            margin: 0; 
+            color: #484f58; 
+        }
+
+        .muted { color: #484f58; }
+
+        .secret-link { 
+            color: #484f58; 
+            text-decoration: none; 
+            transition: color 0.3s; 
+        }
+        
+        .secret-link:hover { 
+            color: var(--text-main); 
+            text-decoration: underline; 
+        }
+
+        .terminal-link { 
+            display: inline-block;
+            text-decoration: none; 
+            font-size: 12px; 
+            color: #484f58; 
+            transition: all 0.3s ease; 
+            margin-top: 4px;
+        }
+
+        .prompt { 
+            color: #484f58; 
+            margin-right: 6px; 
+            transition: color 0.3s; 
+        }
+
+        .cmd { 
+            color: #484f58; 
+            transition: color 0.3s; 
+        }
+
+        /* 闪烁光标彩蛋 */
+        .cursor { 
+            display: inline-block; 
+            width: 6px; 
+            height: 14px; 
+            background-color: var(--oscp-green); 
+            vertical-align: middle; 
+            margin-left: 4px; 
+            opacity: 0; 
+        }
+
+        .terminal-link:hover .prompt { color: var(--oscp-green); text-shadow: 0 0 5px var(--oscp-green); }
+        .terminal-link:hover .cmd { color: var(--text-main); }
+        .terminal-link:hover .cursor { animation: blink 1s step-end infinite; }
+
+        @keyframes blink { 
+            0%, 100% { opacity: 0; } 
+            50% { opacity: 1; } 
+        }
+    </style>
+</head>
+<body class="min-h-screen flex flex-col">
+    <div id="app" class="w-full min-h-screen flex flex-col">
+        
+        <div class="flex-1 flex flex-col">
+            <Transition name="fade" mode="out-in">
+                <div v-if="!operatorName" class="flex-1 flex justify-center items-center w-full p-4">
+                    <div class="glass-card p-10 w-full max-w-[420px] shadow-2xl">
+                        <h1 class="text-3xl font-bold text-center mb-2">
+                            <span style="color: var(--oscp-green)">OSCP</span> <span class="text-white">Paper Lab</span>
+                        </h1>
+                        <p class="text-center text-[#8b949e] text-sm mb-10">输入特工代号以接入推演终端。</p>
+                        <div class="mb-8">
+                            <label class="block text-[#8b949e] text-xs mb-2 font-medium">特工代号 (Operator Handle)</label>
+                            <input v-model="tempName" @keyup.enter="login" type="text" class="w-full bg-[#0d1117] border border-[#5cb85c] rounded-md p-3 text-white text-center tracking-widest focus:outline-none focus:ring-1 focus:ring-[#5cb85c]" placeholder="hack3r">
+                        </div>
+                        <button @click="login" class="pro-btn w-full py-3 mb-8 text-sm tracking-wide">初始化会话 (Initialize Session)</button>
+                        <div class="border-t border-[#30363d] pt-6 text-center">
+                            <p class="text-[10px] text-[#8b949e] mono uppercase tracking-widest mb-1">SECURE TERMINAL ACCESS</p>
+                        </div>
+                    </div>
+                </div>
+
+                <div v-else-if="!currentLab" class="flex-1 flex justify-center items-center w-full p-4 fade-in">
+                    <div class="w-full max-w-[1000px]">
+                        <div class="flex justify-between items-end mb-6 px-1">
+                            <div>
+                                <h1 class="text-2xl font-bold text-white tracking-wide flex items-center gap-2">
+                                    <span style="color: var(--oscp-green)">OSCP</span> Paper Lab
+                                </h1>
+                                <p class="text-[13px] text-[#8b949e] mt-1">靶机演练控制中心 (Command Center)</p>
+                            </div>
+                            <div class="flex items-center gap-4 mb-1">
+                                <span class="text-xs text-[#8b949e] mono">OP: <span class="text-white font-bold">{{ operatorName }}</span></span>
+                                <button @click="logout" class="text-[11px] px-3 py-1.5 border border-[#30363d] rounded text-[#8b949e] hover:text-white hover:border-[#8b949e] transition">[ 注销 ]</button>
+                            </div>
+                        </div>
+
+                        <div class="grid grid-cols-1 md:grid-cols-12 gap-6">
+                            <div class="md:col-span-7 lg:col-span-8 glass-card p-8 shadow-2xl flex flex-col justify-between">
+                                <div>
+                                    <h2 class="text-lg font-bold text-white mb-2 flex items-center gap-2">
+                                        <span style="color: var(--oscp-green)" class="mono text-base">ls</span> 部署推演靶机
+                                    </h2>
+                                    <p class="text-xs text-[#8b949e] mb-8">设定推演条件，系统将自动盲盒分配情报靶机并切入实战。</p>
+                                    <div class="grid grid-cols-1 sm:grid-cols-2 gap-6 mb-10">
+                                        <div>
+                                            <label class="block text-xs text-[#8b949e] mb-2 font-medium uppercase tracking-wider">考点方向 (Domain)</label>
+                                            <select v-model="filter.domain" class="pro-input w-full p-3 text-sm cursor-pointer shadow-inner">
+                                                <option value="">-- 随机任意方向 --</option>
+                                                <option v-for="d in uniqueDomains" :key="d" :value="d">{{ d }}</option>
+                                            </select>
+                                        </div>
+                                        <div>
+                                            <label class="block text-xs text-[#8b949e] mb-2 font-medium uppercase tracking-wider">威胁难度 (Difficulty)</label>
+                                            <select v-model="filter.difficulty" class="pro-input w-full p-3 text-sm cursor-pointer shadow-inner">
+                                                <option value="">-- 随机任意难度 --</option>
+                                                <option value="Easy">Easy</option>
+                                                <option value="Medium">Medium</option>
+                                                <option value="Hard">Hard</option>
+                                            </select>
+                                        </div>
+                                    </div>
+                                </div>
+                                <div>
+                                    <button @click="generateRandomLab" class="pro-btn w-full py-4 text-sm tracking-widest shadow-lg font-bold">开始随机匹配靶机</button>
+                                    <div v-if="matchError" class="mt-4 text-center text-red-400 text-xs py-2 bg-[#2d1114] border border-[#7a2c35] rounded font-medium">
+                                        [!] 未找到符合条件的靶机，请尝试放宽筛选条件。
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div class="md:col-span-5 lg:col-span-4 glass-card p-6 shadow-2xl flex flex-col h-[400px]">
+                                <h3 class="text-[11px] font-bold text-[#8b949e] uppercase tracking-wider mb-4 border-b border-[#30363d] pb-3 flex justify-between">
+                                    <span>历史归档 (Archive)</span>
+                                    <span class="text-[#5cb85c]">{{ history.length }} Ops</span>
+                                </h3>
+                                <div class="flex-1 overflow-y-auto space-y-3 custom-scroll">
+                                    <div v-for="item in history" :key="item.id" class="p-3 bg-[#0d1117] border border-[#30363d] rounded flex flex-col gap-1 hover:border-[#8b949e] transition cursor-default">
+                                        <div class="flex justify-between items-center">
+                                            <span class="text-xs font-bold text-white uppercase">{{ item.lab_id }}</span>
+                                            <span :class="['text-[10px] px-2 py-0.5 rounded font-mono font-bold', item.avg_score >= 7 ? 'text-[#5cb85c] bg-[#5cb85c]/10' : 'text-red-400 bg-red-400/10']">{{ item.avg_score }} PT</span>
+                                        </div>
+                                        <div class="text-[10px] text-[#8b949e] mono">{{ item.timestamp }}</div>
+                                    </div>
+                                    <div v-if="history.length === 0" class="h-full flex flex-col items-center justify-center text-xs text-[#8b949e] opacity-50">暂无推演记录</div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div v-else class="w-full flex-1 flex flex-col max-w-[1500px] mx-auto p-4 md:p-8 fade-in pb-10">
+                    
+                    <div v-if="loading" class="loading-overlay">
+                        <div class="spinner mb-4"></div>
+                        <div class="text-xs text-[#c9d1d9] tracking-widest mono uppercase font-bold">Auditing Strategy...</div>
+                    </div>
+
+                    <div class="flex flex-col md:flex-row justify-between items-start md:items-end mb-8 pb-6 border-b border-[#30363d]">
+                        <div>
+                            <h2 class="text-3xl font-black text-white uppercase tracking-tight mb-3">{{ currentLabId }}</h2>
+                            <div class="flex items-center gap-3">
+                                <span class="px-2.5 py-1 bg-[#161b22] border border-[#30363d] rounded text-[11px] text-[#c9d1d9] font-mono shadow-sm">{{ currentLab.os }}</span>
+                                <span class="px-2.5 py-1 bg-[#161b22] border border-[#30363d] rounded text-[11px] text-[#c9d1d9] font-mono shadow-sm">{{ currentLab.difficulty }}</span>
+                                <span class="px-2.5 py-1 bg-[#161b22] border border-[#30363d] rounded text-[11px] text-[#5cb85c] font-mono shadow-sm">{{ currentLab.domain }}</span>
+                            </div>
+                        </div>
+                        <div class="flex items-center gap-4 mt-4 md:mt-0">
+                            <span class="text-xs text-[#8b949e] mono hidden md:inline">OP: <span class="text-white">{{ operatorName }}</span></span>
+                            <button @click="backToDashboard" class="px-5 py-2 border border-[#30363d] rounded text-sm font-medium text-[#8b949e] hover:text-red-400 hover:border-red-400 hover:bg-[#2d1114] transition shadow-sm">终止推演任务</button>
+                        </div>
+                    </div>
+
+                    <div class="grid grid-cols-1 xl:grid-cols-12 gap-10 pb-10 border-b border-[#30363d]/30">
+                        
+                        <div class="xl:col-span-5 relative">
+                            <div class="sticky top-6 space-y-4">
+                                <h3 class="text-sm font-bold text-[#8b949e] uppercase tracking-wider mb-2 flex items-center gap-2">
+                                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"></path><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"></path></svg>
+                                    情报档案 (Intel)
+                                </h3>
+                                
+                                <div class="bg-[#0d1117] border border-[#30363d] p-4 rounded-lg shadow-inner max-h-[calc(100vh-140px)] overflow-y-auto custom-scroll">
+                                    <div class="space-y-3">
+                                        <details v-for="section in parsedSections" :key="section.title" class="intel-details group" open>
+                                            <summary class="intel-summary text-xs font-semibold text-[#c9d1d9] hover:text-white flex justify-between items-center">
+                                                <span># {{ section.title }}</span>
+                                                <span class="group-open:rotate-180 transition text-[#8b949e]">▼</span>
+                                            </summary>
+                                            <pre class="p-4 text-[11px] text-[#8b949e] mono leading-relaxed overflow-x-auto bg-[#0d1117]">{{ section.content }}</pre>
+                                        </details>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="xl:col-span-7 space-y-6">
+                            <h3 class="text-sm font-bold text-[#8b949e] uppercase tracking-wider mb-2 flex items-center gap-2">
+                                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"></path><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"></path></svg>
+                                分析推演 (Strategy Analysis)
+                            </h3>
+                            <div class="glass-card p-6 shadow-xl">
+                                <div class="space-y-8">
+                                    <div v-for="(q, idx) in currentLab.questions" :key="idx" :id="'task-' + idx" class="p-5 bg-[#0d1117] border border-[#30363d] rounded-lg">
+                                        <p class="text-[13px] text-white mb-3 font-semibold leading-relaxed border-l-2 border-[#5cb85c] pl-3">任务 0{{ idx + 1 }}: {{ q.text }}</p>
+                                        <div class="text-[11px] text-[#5cb85c] mb-4 mono bg-[#5cb85c]/10 px-3 py-1.5 rounded inline-block">-- FOCUS: {{ q.focus }}</div>
+                                        
+                                        <textarea v-model="studentAnswers[idx]" :disabled="report != null" class="w-full h-32 pro-input p-4 text-[13px] leading-relaxed mono resize-y shadow-inner transition-all" :class="report ? 'opacity-50' : ''" placeholder="输入漏洞分析及推演细节..."></textarea>
+
+                                        <div v-if="report && getFeedback(idx + 1)" class="mt-4 bg-[#161b22] border border-[#30363d] rounded-lg border-l-4 shadow-md fade-in" :class="getFeedback(idx + 1).score >= 7 ? 'border-l-[#5cb85c]' : 'border-l-red-500'">
+                                            <div class="px-5 py-3 border-b border-[#30363d] flex justify-between items-center bg-[#21262d]/50">
+                                                <span class="text-xs font-bold text-white flex items-center gap-2">
+                                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2a10 10 0 1 0 10 10H12V2z"></path><path d="M12 12 2.1 7.1"></path><path d="M12 12l9.9 4.9"></path></svg>
+                                                    考官点评分析
+                                                </span>
+                                                <span :class="['text-xs px-2 py-0.5 rounded font-mono font-bold', getFeedback(idx + 1).score >= 7 ? 'bg-[#5cb85c]/10 text-[#5cb85c]' : 'bg-red-500/10 text-red-400']">{{ getFeedback(idx + 1).score }} PT</span>
+                                            </div>
+                                            <div class="p-5">
+                                                <p class="text-[13px] text-[#c9d1d9] leading-relaxed mb-4">{{ getFeedback(idx + 1).feedback }}</p>
+                                                
+                                                <div class="flex flex-wrap gap-2 pt-3 border-t border-[#30363d]">
+                                                    <span v-for="miss in getFeedback(idx + 1).missed_key_insights" :key="miss" class="bg-[#2d1114] border border-[#7a2c35] text-red-400 text-[10px] px-2.5 py-1 rounded-sm font-mono shadow-sm">
+                                                        MISSING: {{ miss }}
+                                                    </span>
+                                                    <span v-if="!getFeedback(idx + 1).missed_key_insights || getFeedback(idx + 1).missed_key_insights.length === 0" class="text-[10px] text-[#5cb85c] font-mono font-medium">
+                                                        [+] NO CRITICAL INSIGHTS MISSED
+                                                    </span>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+
+                                <button v-if="!report" @click="submitSolution" :disabled="loading" class="pro-btn w-full py-4 text-sm tracking-widest mt-4 shadow-lg shadow-[#5cb85c]/10">
+                                    提交推演并呼叫 AI 执行评估
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div v-if="report" class="glass-card overflow-hidden shadow-2xl fade-in w-full max-w-[1200px] mx-auto border-t-4 border-t-[#5cb85c] mt-10" id="report-anchor">
+                        <div class="bg-[#161b22] border-b border-[#30363d] p-6 text-center">
+                            <h2 class="text-xl font-bold text-white tracking-[5px] uppercase">Final Report Card</h2>
+                        </div>
+                        
+                        <div class="p-8">
+                            <div class="grid grid-cols-1 md:grid-cols-12 gap-8">
+                                <div class="md:col-span-8 p-6 bg-[#0d1117] border border-[#30363d] rounded-lg">
+                                    <p class="text-[10px] text-[#5cb85c] font-bold mb-3 uppercase mono">Executive Summary</p>
+                                    <p class="text-sm text-[#c9d1d9] leading-relaxed italic">"{{ report.evaluation_report.executive_summary }}"</p>
+                                </div>
+                                <div class="md:col-span-4 p-6 bg-[#0d1117] border border-[#30363d] rounded-lg flex flex-col justify-center">
+                                    <p class="text-[10px] text-[#5cb85c] font-bold mb-5 uppercase mono text-center">Score Matrix</p>
+                                    <div v-for="q in report.question_feedback" :key="q.question_id" class="flex items-center gap-3 mb-3">
+                                        <span class="text-xs text-[#8b949e] mono min-w-[35px]">T-0{{q.question_id}}</span>
+                                        <div class="flex-1 h-1.5 bg-[#30363d] rounded-full overflow-hidden">
+                                            <div class="h-full bg-[#5cb85c] shadow-[0_0_8px_rgba(92,184,92,0.5)]" :style="{width: (q.score*10)+'%'}"></div>
+                                        </div>
+                                        <span class="text-xs font-bold text-white mono">{{q.score}}/10</span>
+                                    </div>
+                                </div>
+                            </div>
+                            
+                            <div class="mt-8 text-center">
+                                 <button @click="backToDashboard" class="px-8 py-3 bg-[#161b22] border border-[#30363d] text-white font-bold rounded hover:bg-[#21262d] transition text-sm shadow-sm">
+                                    确认复盘，返回指挥中心
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+
+                </div>
+            </Transition>
+        </div>
+
+        <footer class="cyber-footer">
+            <div class="footer-content">
+                <p class="terminal-text">
+                    <span class="muted">© 2026 </span>
+                    <a href="https://github.com/cxtwit" target="_blank" class="secret-link">tw1t</a>
+                    <span class="muted">. All rights reversed. </span>
+                </p>
+                <a href="https://github.com/cxtwit/PaperLab" target="_blank" class="terminal-link">
+                    <span class="prompt">root@paperlab:~#</span> <span class="cmd">cat /github/repo</span><span class="cursor"></span>
+                </a>
+            </div>
+        </footer>
+
+    </div>
+
+    <script>
+        const { createApp, ref, computed, onMounted } = Vue
+        createApp({
+            setup() {
+                const operatorName = ref(localStorage.getItem('paperlab_user') || ''); 
+                const tempName = ref('');
+                const labs = ref([]); 
+                const currentLabId = ref(null); 
+                const currentLab = ref(null);
+                const studentAnswers = ref([]); 
+                const history = ref([]); 
+                const loading = ref(false); 
+                const report = ref(null);
+                const matchError = ref(false);
+                const filter = ref({ domain: '', difficulty: '' });
+
+                const login = () => { if(tempName.value.trim()) { operatorName.value = tempName.value.trim(); localStorage.setItem('paperlab_user', operatorName.value); initSession(); } }
+                const logout = () => { operatorName.value = ''; localStorage.removeItem('paperlab_user'); backToDashboard(); }
+                const backToDashboard = () => { currentLab.value = null; currentLabId.value = null; report.value = null; matchError.value = false; window.scrollTo(0,0); }
+
+                const uniqueDomains = computed(() => [...new Set(labs.value.map(l => l.domain).filter(d => d))]);
+                const parsedSections = computed(() => {
+                    if (!currentLab.value || !currentLab.value.context) return [];
+                    return currentLab.value.context.split(/^##\s+/m).filter(p => p.trim()).map(p => {
+                        const lines = p.split('\n'); return { title: lines[0].trim(), content: lines.slice(1).join('\n').trim() }
+                    })
+                });
+
+                const getFeedback = (qId) => {
+                    if (!report.value || !report.value.question_feedback) return null;
+                    return report.value.question_feedback.find(f => f.question_id === qId) || report.value.question_feedback[qId - 1];
+                }
+
+                const initSession = async () => {
+                    if(!operatorName.value) return;
+                    try {
+                        const lRes = await fetch('/api/list_labs'); labs.value = await lRes.json();
+                        const hRes = await fetch(`/api/history?username=${operatorName.value}`); history.value = await hRes.json();
+                    } catch(e) { console.error("API Error"); }
+                }
+
+                const generateRandomLab = async () => {
+                    matchError.value = false;
+                    const matchedLabs = labs.value.filter(lab => {
+                        const matchDomain = filter.value.domain === '' || lab.domain === filter.value.domain;
+                        const matchDiff = filter.value.difficulty === '' || lab.difficulty === filter.value.difficulty;
+                        return matchDomain && matchDiff;
+                    });
+                    if (matchedLabs.length === 0) { matchError.value = true; return; }
+                    await selectLab(matchedLabs[Math.floor(Math.random() * matchedLabs.length)].id);
+                }
+
+                const selectLab = async (id) => {
+                    currentLabId.value = id; report.value = null;
+                    try {
+                        const res = await fetch(`/api/get_lab/${id}`); currentLab.value = await res.json();
+                        studentAnswers.value = new Array(currentLab.value.questions.length).fill("");
+                        window.scrollTo(0,0);
+                    } catch(e) { alert("Failed to fetch intel."); }
+                }
+
+                const submitSolution = async () => {
+                    loading.value = true;
+                    try {
+                        const combined = currentLab.value.questions.map((q, i) => `[推演任务: ${q.text}]\n学生回答: ${studentAnswers.value[i]}`).join('\n\n');
+                        const res = await fetch('/api/evaluate', {
+                            method: 'POST', headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ lab_id: currentLabId.value, username: operatorName.value, answers: { "student_writeup": combined } })
+                        });
+                        report.value = await res.json(); await initSession(); 
+                        setTimeout(() => document.getElementById('report-anchor').scrollIntoView({ behavior: 'smooth', block: 'start' }), 300);
+                    } catch(e) { alert("AI Evaluation Failed."); } finally { loading.value = false; }
+                }
+
+                onMounted(() => { if(operatorName.value) initSession(); });
+                
+                return { 
+                    operatorName, tempName, labs, currentLabId, currentLab, studentAnswers, history, loading, report, matchError, filter, uniqueDomains, parsedSections, getFeedback, login, logout, backToDashboard, generateRandomLab, submitSolution 
+                }
+            }
+        }).mount('#app')
+    </script>
+</body>
+</html>
