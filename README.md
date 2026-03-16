@@ -46,6 +46,15 @@ LLM模型批阅：
 本项目自带一个包含示例靶机的 `paperlab.db`，需要自行在`mian.py`配置**DeepSeek API**即可直接运行体验：
 
 ### 1. 启动 Demo 终端
+
+安装模块
+
+```cmd
+python -m pip install -r requirements.txt
+```
+
+启动服务
+
 ```bash
 uvicorn main:app --reload main.py
 ```
