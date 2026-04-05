@@ -222,10 +222,10 @@
                             <div class="md:col-span-5 lg:col-span-4 glass-card p-6 shadow-2xl flex flex-col" style="min-height:400px; max-height:620px;">
                                 <!-- Tab 切换 -->
                                 <div class="flex gap-1 mb-4 border-b border-[#30363d] pb-3">
-                                    <button v-for="tab in ['history','stats','bookmarks','sm2','upload']" :key="tab"
+                                    <button v-for="tab in ['history','stats','bookmarks','sm2','leaderboard','upload']" :key="tab"
                                         @click="dashTab = tab"
                                         class="tab-btn" :class="dashTab === tab ? 'active' : ''">
-                                        {{ tab === 'history' ? '战报' : tab === 'stats' ? '统计' : tab === 'bookmarks' ? '错题本' : tab === 'sm2' ? '复盘' : '上传' }}
+                                        {{ tab === 'history' ? '战报' : tab === 'stats' ? '统计' : tab === 'bookmarks' ? '错题本' : tab === 'sm2' ? '复盘' : tab === 'leaderboard' ? '排行榜' : '上传' }}
                                     </button>
                                 </div>
 
@@ -297,7 +297,14 @@
 
                                 <!-- 错题本 -->
                                 <div v-else-if="dashTab === 'bookmarks'" class="flex-1 overflow-y-auto custom-scroll space-y-3">
-                                    <div v-if="bookmarks.length === 0" class="flex items-center justify-center pt-10 text-xs text-[#8b949e] opacity-50">错题本为空</div>
+                                    <!-- 头部：计数 + 导出按钮 -->
+                                    <div v-if="bookmarks.length > 0" class="flex justify-between items-center pb-2 border-b border-[#30363d] mb-1">
+                                        <span class="text-[10px] text-[#8b949e] mono">共 {{ bookmarks.length }} 条错题</span>
+                                        <button @click="exportBookmarks"
+                                            class="text-[10px] px-2.5 py-1 border border-[#30363d] rounded text-[#8b949e] hover:border-[#5cb85c] hover:text-[#5cb85c] transition mono">
+                                            ↓ 导出 Markdown
+                                        </button>
+                                    </div>
                                     <div v-for="bm in bookmarks" :key="bm.id"
                                         class="p-3 bg-[#0d1117] border border-[#30363d] rounded hover:border-[#8b949e] transition">
                                         <div class="flex justify-between items-start gap-2">
@@ -359,6 +366,40 @@
                                     <div v-else class="flex flex-col items-center justify-center pt-10 gap-2">
                                         <div class="text-xs text-[#8b949e] opacity-50">今日暂无需要复盘的题目</div>
                                         <div class="text-[10px] text-[#484f58]">完成练习后系统将自动安排复盘</div>
+                                    </div>
+                                </div>
+
+                                <!-- 排行榜 -->
+                                <div v-else-if="dashTab === 'leaderboard'" class="flex-1 overflow-y-auto custom-scroll">
+                                    <div v-if="!leaderboard" class="flex items-center justify-center pt-10 text-xs text-[#8b949e] opacity-50">加载中...</div>
+                                    <div v-else-if="leaderboard.length === 0" class="flex items-center justify-center pt-10 text-xs text-[#8b949e] opacity-50">暂无排行数据</div>
+                                    <div v-else class="space-y-2">
+                                        <div class="grid grid-cols-12 text-[10px] text-[#484f58] mono uppercase px-2 mb-1">
+                                            <span class="col-span-1">#</span>
+                                            <span class="col-span-6">特工代号</span>
+                                            <span class="col-span-3 text-center">平均分</span>
+                                            <span class="col-span-2 text-right">次数</span>
+                                        </div>
+                                        <div v-for="entry in leaderboard" :key="entry.rank"
+                                            class="grid grid-cols-12 items-center px-2 py-2 rounded border transition"
+                                            :class="entry.operator_name === operatorName
+                                                ? 'bg-[#5cb85c]/10 border-[#5cb85c]/40'
+                                                : 'bg-[#0d1117] border-[#30363d] hover:border-[#8b949e]'">
+                                            <span class="col-span-1 text-[11px] mono font-bold"
+                                                :class="entry.rank === 1 ? 'text-[#e3b341]' : entry.rank === 2 ? 'text-[#8b949e]' : entry.rank === 3 ? 'text-[#c96a2e]' : 'text-[#484f58]'">
+                                                {{ entry.rank <= 3 ? ['🥇','🥈','🥉'][entry.rank-1] : entry.rank }}
+                                            </span>
+                                            <span class="col-span-6 text-[12px] font-semibold truncate"
+                                                :class="entry.operator_name === operatorName ? 'text-[#5cb85c]' : 'text-white'">
+                                                {{ entry.operator_name }}
+                                                <span v-if="entry.operator_name === operatorName" class="text-[9px] text-[#5cb85c] mono ml-1">[YOU]</span>
+                                            </span>
+                                            <span class="col-span-3 text-center text-[12px] font-bold mono"
+                                                :class="entry.avg_score >= 7 ? 'text-[#5cb85c]' : 'text-red-400'">
+                                                {{ entry.avg_score }}
+                                            </span>
+                                            <span class="col-span-2 text-right text-[10px] text-[#8b949e] mono">{{ entry.total_submissions }}次</span>
+                                        </div>
                                     </div>
                                 </div>
 
@@ -588,6 +629,7 @@
                 const operatorName = ref(localStorage.getItem('paperlab_user') || '');
                 const tempName = ref('');
                 const labs = ref([]);
+                const doneLabIds = ref(new Set());
                 const currentLabId = ref(null);
                 const currentLab = ref(null);
                 const studentAnswers = ref([]);
@@ -609,6 +651,8 @@
                 const sm2Answer = ref('');
                 const sm2Loading = ref(false);
                 const sm2Done = ref(false);
+                // 排行榜
+                const leaderboard = ref(null);
                 // 上传裂变
                 const uploadFile = ref(null);
                 const uploadDeriveCount = ref(3);
@@ -643,13 +687,16 @@
                     timerInterval = setInterval(() => {
                         if (timerSecondsLeft.value <= 0) {
                             clearInterval(timerInterval);
-                            // 自动跳下一题，全部答完则提交
+                            // 自动跳下一题，全部答完则提交（仅当有内容时）
                             const nextQ = qIdx + 1;
                             if (nextQ < (currentLab.value?.questions?.length || 0)) {
                                 startTimer(nextQ);
                                 document.getElementById('task-' + nextQ)?.scrollIntoView({ behavior: 'smooth', block: 'center' });
                             } else {
-                                submitSolution();
+                                const hasAnyAnswer = studentAnswers.value.some(a => a && a.trim().length > 0);
+                                if (hasAnyAnswer) {
+                                    submitSolution();
+                                }
                             }
                         } else {
                             timerSecondsLeft.value--;
@@ -660,7 +707,14 @@
                 const stopTimer = () => { clearInterval(timerInterval); timerInterval = null; };
 
                 const login = () => { if(tempName.value.trim()) { operatorName.value = tempName.value.trim(); localStorage.setItem('paperlab_user', operatorName.value); initSession(); } }
-                const logout = () => { operatorName.value = ''; localStorage.removeItem('paperlab_user'); backToDashboard(); }
+                const logout = () => {
+                    operatorName.value = '';
+                    localStorage.removeItem('paperlab_user');
+                    historyPage.value = 1;
+                    history.value = [];
+                    historyTotal.value = 0;
+                    backToDashboard();
+                }
                 const backToDashboard = () => {
                     stopTimer();
                     currentLab.value = null; currentLabId.value = null; report.value = null;
@@ -670,8 +724,7 @@
 
                 const uniqueDomains = computed(() => [...new Set(labs.value.map(l => l.domain).filter(d => d))]);
 
-                // 当前用户已做过的靶机 id 集合
-                const doneLabIds = computed(() => new Set(history.value.map(h => h.lab_id)));
+                // doneLabIds 现在是从 /api/done_labs 拉取的完整集合（ref，非 computed）
                 const parsedSections = computed(() => {
                     if (!currentLab.value || !currentLab.value.context) return [];
                     return currentLab.value.context.split(/^##\s+/m).filter(p => p.trim()).map(p => {
@@ -686,13 +739,15 @@
 
                 const initSession = async () => {
                     if(!operatorName.value) return;
+                    historyPage.value = 1;
                     try {
-                        const [lRes, hRes, sRes, bRes, sm2sRes] = await Promise.all([
+                        const [lRes, hRes, sRes, bRes, sm2sRes, doneRes] = await Promise.all([
                             fetch('/api/list_labs'),
                             fetch(`/api/history?username=${encodeURIComponent(operatorName.value)}&page=1&page_size=15`),
                             fetch(`/api/stats?username=${encodeURIComponent(operatorName.value)}`),
                             fetch(`/api/bookmarks?username=${encodeURIComponent(operatorName.value)}`),
                             fetch(`/api/sm2/stats?username=${encodeURIComponent(operatorName.value)}`),
+                            fetch(`/api/done_labs?username=${encodeURIComponent(operatorName.value)}`),
                         ]);
                         labs.value = await lRes.json();
                         const hData = await hRes.json();
@@ -701,6 +756,7 @@
                         stats.value = await sRes.json();
                         bookmarks.value = await bRes.json();
                         sm2Stats.value = await sm2sRes.json();
+                        doneLabIds.value = new Set(await doneRes.json());
                     } catch(e) { console.error("API Error", e); }
                 }
 
@@ -811,16 +867,14 @@
 
                 const generateRandomLab = async () => {
                     matchError.value = false;
-                    const params = new URLSearchParams();
-                    if (filter.value.os) params.append('os', filter.value.os);
-                    if (filter.value.domain) params.append('domain', filter.value.domain);
-                    if (filter.value.difficulty) params.append('difficulty', filter.value.difficulty);
-                    const qs = params.toString();
-                    const res = await fetch(`/api/list_labs${qs ? '?' + qs : ''}`);
-                    const filtered = await res.json();
-                    const matchedLabs = filtered.filter(lab => !filter.value.excludeDone || !doneLabIds.value.has(lab.id));
-                    if (matchedLabs.length === 0) { matchError.value = true; return; }
-                    await selectLab(matchedLabs[Math.floor(Math.random() * matchedLabs.length)].id);
+                    // 直接在本地 labs.value 上过滤，不重复发请求
+                    let filtered = labs.value;
+                    if (filter.value.os) filtered = filtered.filter(l => l.os === filter.value.os);
+                    if (filter.value.domain) filtered = filtered.filter(l => l.domain === filter.value.domain);
+                    if (filter.value.difficulty) filtered = filtered.filter(l => l.difficulty === filter.value.difficulty);
+                    if (filter.value.excludeDone) filtered = filtered.filter(l => !doneLabIds.value.has(l.id));
+                    if (filtered.length === 0) { matchError.value = true; return; }
+                    await selectLab(filtered[Math.floor(Math.random() * filtered.length)].id);
                 }
 
                 const retryLab = async (labId) => {
@@ -883,9 +937,27 @@
                     } catch(e) { alert("删除失败。"); }
                 }
 
+                const exportBookmarks = () => {
+                    const url = `/api/bookmarks/export?username=${encodeURIComponent(operatorName.value)}`;
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = `paperlab_wrongbook_${operatorName.value}.md`;
+                    document.body.appendChild(a);
+                    a.click();
+                    document.body.removeChild(a);
+                }
+
+                const loadLeaderboard = async () => {
+                    try {
+                        const res = await fetch('/api/leaderboard');
+                        leaderboard.value = await res.json();
+                    } catch(e) { console.error(e); }
+                }
+
                 watch(dashTab, (tab) => {
                     if (tab === 'stats' && !stats.value) initSession();
                     if (tab === 'sm2') loadSm2Today();
+                    if (tab === 'leaderboard') loadLeaderboard();
                 });
 
                 onMounted(() => { if(operatorName.value) initSession(); });
@@ -894,11 +966,12 @@
                 return {
                     operatorName, tempName, labs, currentLabId, currentLab, studentAnswers, history, loading, report, matchError, filter,
                     uniqueDomains, parsedSections, getFeedback, login, logout, backToDashboard, generateRandomLab, retryLab, submitSolution,
-                    dashTab, stats, bookmarks, savedBookmarks, saveBookmark, deleteBookmark,
+                    dashTab, stats, bookmarks, savedBookmarks, saveBookmark, deleteBookmark, exportBookmarks,
                     timedMode, timerCurrentQ, timerPct, timerDisplay,
                     doneLabIds,
-                    submitSm2Answer, loadSm2Today, onFileChange, startUploadBuild,
+                    submitSm2Answer, loadSm2Today, loadLeaderboard, onFileChange, startUploadBuild,
                     sm2Today, sm2Stats, sm2CurrentIdx, sm2Answer, sm2Loading, sm2Done,
+                    leaderboard,
                     uploadFile, uploadDeriveCount, uploadQualityCheck, uploadProgress, uploadLog, uploading,
                 }
             }

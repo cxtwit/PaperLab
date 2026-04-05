@@ -112,7 +112,7 @@ def input_base_url():
         if url == "custom":
             while True:
                 url = input("  请输入自定义 Base URL > ").strip()
-                if url.startswith("http"):
+        if url.startswith(("http://", "https://")):
                     break
                 print_red("  [!] URL 必须以 http:// 或 https:// 开头。")
 
@@ -185,7 +185,7 @@ def update_gitignore():
     if os.path.exists(gitignore_path):
         with open(gitignore_path, "r", encoding="utf-8") as f:
             content = f.read()
-        if config_entry not in content:
+        if config_entry not in content.splitlines():
             with open(gitignore_path, "a", encoding="utf-8") as f:
                 f.write(f"\n# PaperLab 本地配置（含 API Key，禁止提交）\n{config_entry}\n")
     else:

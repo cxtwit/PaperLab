@@ -10,6 +10,7 @@ import re
 import random
 import sqlite3
 import sys
+import uuid
 
 DB_FILE = "paperlab.db"
 CONFIG_FILE = "config.json"
@@ -30,6 +31,49 @@ def load_config():
         sys.exit(1)
     with open(CONFIG_FILE, "r", encoding="utf-8") as f:
         return json.load(f)
+
+
+# ==========================================
+# 0.5 统一数据库初始化（build.py 和 main.py 共用）
+# ==========================================
+def ensure_db(db_file=DB_FILE):
+    """确保所有表都已创建。build.py 和 main.py 启动时都调用此函数。"""
+    conn = sqlite3.connect(db_file)
+    conn.execute("PRAGMA journal_mode=WAL")
+    cursor = conn.cursor()
+    cursor.execute('''CREATE TABLE IF NOT EXISTS labs (
+        id TEXT PRIMARY KEY, os TEXT, difficulty TEXT, domain TEXT,
+        tags TEXT, context TEXT, questions TEXT, focus_points TEXT
+    )''')
+    cursor.execute('''CREATE TABLE IF NOT EXISTS submissions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, lab_id TEXT,
+        operator_name TEXT, student_writeup TEXT, report TEXT,
+        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+    )''')
+    cursor.execute('''CREATE TABLE IF NOT EXISTS bookmarks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, operator_name TEXT,
+        lab_id TEXT, question_text TEXT, question_focus TEXT,
+        missed_insights TEXT, feedback TEXT, score INTEGER,
+        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+    )''')
+    cursor.execute('''CREATE TABLE IF NOT EXISTS sm2_schedule (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        operator_name TEXT NOT NULL,
+        lab_id TEXT NOT NULL,
+        question_idx INTEGER NOT NULL,
+        question_text TEXT,
+        easiness REAL DEFAULT 2.5,
+        interval INTEGER DEFAULT 1,
+        repetitions INTEGER DEFAULT 0,
+        next_review DATE DEFAULT (date('now')),
+        last_score INTEGER DEFAULT 0,
+        UNIQUE(operator_name, lab_id, question_idx)
+    )''')
+    cursor.execute('''CREATE TABLE IF NOT EXISTS build_history (
+        original_name TEXT PRIMARY KEY, new_name TEXT
+    )''')
+    conn.commit()
+    conn.close()
 
 # ==========================================
 # 1. 变异方向指令池 (Mutation Angles)
@@ -129,12 +173,18 @@ def save_lab_to_db(history_id, data, db_file=DB_FILE):
 
 
 def deduplicate_name(name, used_names):
-    """防止名称碰撞：如果名称已存在，加后缀"""
+    """防止名称碰撞：如果名称已存在，加后缀；全部碰撞则 UUID 兜底"""
     original = name
     suffixes = ['Prime', 'Nexus', 'Apex', 'Echo', 'Forge', 'Nova', 'Vanguard', 'Shade', 'Fury', 'Ghost']
-    while name in used_names:
+    for suffix in suffixes:
+        if name not in used_names:
+            return name
         base = original.split('-')[0]
-        name = f"{base}-{random.choice(suffixes)}"
+        name = f"{base}-{suffix}"
+    # 全部后缀碰撞，使用 UUID 短串兜底，保证不重复
+    if name in used_names:
+        base = original.split('-')[0]
+        name = f"{base}-{uuid.uuid4().hex[:6].upper()}"
     return name
 
 

@@ -24,6 +24,7 @@ from fastapi.middleware.cors import CORSMiddleware
 # ==========================================
 from lab_generator import (
     load_config,
+    ensure_db,
     parse_markdown_text_to_machines,
     get_all_used_machine_names,
     generate_single_variant,
@@ -34,7 +35,8 @@ _cfg = load_config()
 
 client = OpenAI(
     api_key=_cfg["api_key"],
-    base_url=_cfg["base_url"]
+    base_url=_cfg["base_url"],
+    timeout=120.0
 )
 AI_MODEL = _cfg["model"]
 
@@ -53,40 +55,7 @@ DB_FILE = "paperlab.db"
 # 2. 数据库初始化（启动时一次性建表）
 # ==========================================
 def init_db():
-    conn = sqlite3.connect(DB_FILE)
-    conn.execute("PRAGMA journal_mode=WAL")
-    cursor = conn.cursor()
-    cursor.execute('''CREATE TABLE IF NOT EXISTS labs (
-        id TEXT PRIMARY KEY, os TEXT, difficulty TEXT, domain TEXT,
-        tags TEXT, context TEXT, questions TEXT, focus_points TEXT
-    )''')
-    cursor.execute('''CREATE TABLE IF NOT EXISTS submissions (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, lab_id TEXT,
-        operator_name TEXT, student_writeup TEXT, report TEXT,
-        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-    )''')
-    cursor.execute('''CREATE TABLE IF NOT EXISTS bookmarks (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, operator_name TEXT,
-        lab_id TEXT, question_text TEXT, question_focus TEXT,
-        missed_insights TEXT, feedback TEXT, score INTEGER,
-        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-    )''')
-    # SM-2 复盘调度表
-    cursor.execute('''CREATE TABLE IF NOT EXISTS sm2_schedule (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        operator_name TEXT NOT NULL,
-        lab_id TEXT NOT NULL,
-        question_idx INTEGER NOT NULL,
-        question_text TEXT,
-        easiness REAL DEFAULT 2.5,
-        interval INTEGER DEFAULT 1,
-        repetitions INTEGER DEFAULT 0,
-        next_review DATE DEFAULT (date('now')),
-        last_score INTEGER DEFAULT 0,
-        UNIQUE(operator_name, lab_id, question_idx)
-    )''')
-    conn.commit()
-    conn.close()
+    ensure_db(DB_FILE)
 
 init_db()
 
@@ -107,6 +76,7 @@ def _print_banner():
 _print_banner()
 def get_db_connection():
     conn = sqlite3.connect(DB_FILE)
+    conn.execute("PRAGMA journal_mode=WAL")
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -155,6 +125,22 @@ async def list_labs(
         return [dict(row) for row in rows]
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database Error: {str(e)}")
+
+@app.get("/api/done_labs")
+async def get_done_labs(username: str):
+    """返回该用户做过的所有靶机 id 列表（用于前端完整排除已做）"""
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT DISTINCT lab_id FROM submissions WHERE operator_name = ?",
+            (username,)
+        )
+        rows = cursor.fetchall()
+        return [row["lab_id"] for row in rows]
+    finally:
+        conn.close()
+
 
 @app.get("/api/get_lab/{lab_id}")
 async def get_lab_detail(lab_id: str):
@@ -300,16 +286,19 @@ async def get_history(username: str, page: int = Query(1, ge=1), page_size: int 
 
         history_list = []
         for row in rows:
-            report = json.loads(row["report"])
+            try:
+                report = json.loads(row["report"])
+            except (json.JSONDecodeError, TypeError):
+                continue  # 跳过损坏的历史记录
             scores = [q["score"] for q in report.get("question_feedback", [])]
             avg = round(sum(scores) / len(scores), 1) if scores else 0
-
+            summary_raw = report.get("evaluation_report", {}).get("executive_summary", "")
             history_list.append({
                 "id": row["id"],
                 "lab_id": row["lab_id"],
                 "timestamp": row["timestamp"],
                 "avg_score": avg,
-                "summary": report["evaluation_report"]["executive_summary"][:50] + "...",
+                "summary": summary_raw[:50] + "..." if len(summary_raw) > 50 else summary_raw,
                 "report": report
             })
         return {"items": history_list, "total": total, "page": page, "page_size": page_size}
@@ -391,15 +380,61 @@ async def delete_bookmark(bookmark_id: int, username: str):
         conn.close()
 
 
+@app.get("/api/bookmarks/export")
+async def export_bookmarks(username: str):
+    """将用户错题本导出为 Markdown 格式文本"""
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT * FROM bookmarks WHERE operator_name = ? ORDER BY timestamp DESC",
+            (username,)
+        )
+        rows = cursor.fetchall()
+        if not rows:
+            raise HTTPException(status_code=404, detail="错题本为空")
+
+        lines = [
+            f"# PaperLab 错题本 — {username}",
+            f"> 导出时间：{__import__('datetime').datetime.now().strftime('%Y-%m-%d %H:%M')}",
+            f"> 共 {len(rows)} 条错题记录",
+            "",
+        ]
+        for i, row in enumerate(rows, 1):
+            missed = json.loads(row["missed_insights"])
+            lines += [
+                f"---",
+                f"## {i}. {row['question_text']}",
+                f"",
+                f"**靶机**：`{row['lab_id']}`　　**得分**：{row['score']}/10　　**时间**：{row['timestamp']}",
+                f"",
+                f"**考点 Focus**：{row['question_focus']}",
+                f"",
+                f"**AI 点评**：",
+                f"",
+                f"> {row['feedback']}",
+                f"",
+            ]
+            if missed:
+                lines.append("**遗漏的核心知识点**：")
+                for m in missed:
+                    lines.append(f"- `{m}`")
+                lines.append("")
+
+        md_content = "\n".join(lines)
+        from fastapi.responses import Response
+        return Response(
+            content=md_content.encode("utf-8"),
+            media_type="text/markdown; charset=utf-8",
+            headers={"Content-Disposition": f'attachment; filename="paperlab_wrongbook_{username}.md"'}
+        )
+    finally:
+        conn.close()
+
+
 # ==========================================
 # 6. MD 文件上传 → 实时裂变生成（SSE）
 # ==========================================
-from lab_generator import (
-    parse_markdown_text_to_machines,
-    get_all_used_machine_names,
-    generate_single_variant,
-    MUTATION_ANGLES,
-)
 import random
 
 MAX_UPLOAD_SIZE = 5 * 1024 * 1024  # 5 MB
@@ -598,8 +633,55 @@ async def sm2_stats(username: str):
 
 
 # ==========================================
-# 5. 个人统计面板 API
+# 5. 个人统计面板 API + 排行榜
 # ==========================================
+
+@app.get("/api/leaderboard")
+async def get_leaderboard(limit: int = Query(20, ge=1, le=100)):
+    """
+    全平台排行榜：按平均分降序，平均分相同则按总次数降序。
+    每个用户只统计有效（含 question_feedback）的提交。
+    """
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT operator_name, report FROM submissions ORDER BY timestamp ASC"
+        )
+        rows = cursor.fetchall()
+
+        user_data: dict[str, dict] = {}
+        for row in rows:
+            name = row["operator_name"]
+            try:
+                report = json.loads(row["report"])
+            except (json.JSONDecodeError, TypeError):
+                continue
+            scores = [q["score"] for q in report.get("question_feedback", []) if isinstance(q.get("score"), (int, float))]
+            if not scores:
+                continue
+            avg = sum(scores) / len(scores)
+            if name not in user_data:
+                user_data[name] = {"total": 0, "score_sum": 0.0}
+            user_data[name]["total"] += 1
+            user_data[name]["score_sum"] += avg
+
+        board = []
+        for name, d in user_data.items():
+            board.append({
+                "operator_name": name,
+                "avg_score": round(d["score_sum"] / d["total"], 1),
+                "total_submissions": d["total"],
+            })
+
+        board.sort(key=lambda x: (-x["avg_score"], -x["total_submissions"]))
+        for i, entry in enumerate(board, 1):
+            entry["rank"] = i
+
+        return board[:limit]
+    finally:
+        conn.close()
+
 
 @app.get("/api/stats")
 async def get_stats(username: str):
@@ -607,38 +689,53 @@ async def get_stats(username: str):
     conn = get_db_connection()
     try:
         cursor = conn.cursor()
+
+        # 总提交数
         cursor.execute(
-            "SELECT s.lab_id, s.report, s.timestamp, l.domain, l.tags, l.difficulty "
+            "SELECT COUNT(*) as total FROM submissions WHERE operator_name = ?",
+            (username,)
+        )
+        total = cursor.fetchone()["total"]
+        if total == 0:
+            return {"total": 0, "avg_score": 0, "domain_stats": [], "tag_stats": [], "trend": []}
+
+        # 拉取必要字段（report 用于解析分数，tags 含 JSON）
+        cursor.execute(
+            "SELECT s.lab_id, s.report, s.timestamp, l.domain, l.tags "
             "FROM submissions s LEFT JOIN labs l ON s.lab_id = l.id "
             "WHERE s.operator_name = ? ORDER BY s.timestamp ASC",
             (username,)
         )
         rows = cursor.fetchall()
 
-        if not rows:
-            return {"total": 0, "avg_score": 0, "domain_stats": [], "tag_stats": [], "trend": []}
-
-        domain_data = {}   # domain -> [scores]
-        tag_data = {}      # tag    -> [scores]
-        trend = []         # [{date, avg_score}]
+        domain_data = {}
+        tag_data = {}
+        trend = []
+        all_avgs = []
 
         for row in rows:
-            report = json.loads(row["report"])
-            scores = [q["score"] for q in report.get("question_feedback", [])]
+            try:
+                report = json.loads(row["report"])
+            except (json.JSONDecodeError, TypeError):
+                continue
+            scores = [q["score"] for q in report.get("question_feedback", []) if isinstance(q.get("score"), (int, float))]
             if not scores:
                 continue
             avg = round(sum(scores) / len(scores), 1)
+            all_avgs.append(avg)
 
             domain = row["domain"] or "Unknown"
             domain_data.setdefault(domain, []).append(avg)
 
-            tags = json.loads(row["tags"]) if row["tags"] else []
+            try:
+                tags = json.loads(row["tags"]) if row["tags"] else []
+            except (json.JSONDecodeError, TypeError):
+                tags = []
             for tag in tags:
                 tag_data.setdefault(tag, []).append(avg)
 
             trend.append({"timestamp": row["timestamp"], "avg_score": avg, "lab_id": row["lab_id"]})
 
-        all_avgs = [t["avg_score"] for t in trend]
         global_avg = round(sum(all_avgs) / len(all_avgs), 1) if all_avgs else 0
 
         domain_stats = sorted([
@@ -652,7 +749,7 @@ async def get_stats(username: str):
         ], key=lambda x: x["avg_score"])
 
         return {
-            "total": len(rows),
+            "total": total,
             "avg_score": global_avg,
             "domain_stats": domain_stats,
             "tag_stats": tag_stats,
