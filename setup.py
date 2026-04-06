@@ -112,7 +112,7 @@ def input_base_url():
         if url == "custom":
             while True:
                 url = input("  请输入自定义 Base URL > ").strip()
-        if url.startswith(("http://", "https://")):
+                if url.startswith(("http://", "https://")):
                     break
                 print_red("  [!] URL 必须以 http:// 或 https:// 开头。")
 
