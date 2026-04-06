@@ -95,18 +95,41 @@ uvicorn main:app --reload
 2. 确认已完成 `python setup.py` 配置。
 3. 运行编译器：
 
-```cmd
-# 全量编译（每份笔记默认裂变 3 个变种）
-python build.py
-
-# 只编译指定靶机，生成 5 个变种，开启质量过滤
-python build.py --target HTB-Lame HTB-Blue --derive 5 --quality
-
-# 5 线程并发加速，最多处理 20 台源机器
-python build.py --workers 5 --max-sources 20
 ```
+$ python build.py
 
-> 完整参数说明：`python build.py --help`
+  ____                        _           _
+ |  _ \ __ _ _ __   ___ _ __| |    __ _| |__
+ | |_) / _` | '_ \ / _ \ '__| |   / _` | '_ \
+ |  __/ (_| | |_) |  __/ |  | |__| (_| | |_) |
+ |_|   \__,_| .__/ \___|_|  |_____\__,_|_.__/
+             |_|
+  ██████╗ ██╗   ██╗██╗██╗     ██████╗
+  ██╔══██╗██║   ██║██║██║     ██╔══██╗
+  ██████╔╝██║   ██║██║██║     ██║  ██║
+  ██╔══██╗██║   ██║██║██║     ██║  ██║
+  ██████╔╝╚██████╔╝██║███████╗██████╔╝
+  ╚═════╝  ╚═════╝ ╚═╝╚══════╝╚═════╝
+  Lab Compiler  -  Mutate. Derive. Pwn.
+  author: tw1t   https://github.com/cxtwit/PaperLab
+
+  用法:
+    python build.py [参数]
+
+  参数:
+    --target  <ID> [ID ...]   只编译指定母体机器，如 HTB-Lame HTB-Blue
+    --derive  <N>             每台母体生成的变种数（默认: 3）
+    --workers <N>             并发线程数，建议不超过 5（默认: 3）
+    --max-sources <N>         最多处理的源机器数量（默认: 50）
+    --quality                 启用质量过滤，额外消耗一次 LLM 调用
+    -h, --help                显示帮助信息
+
+  示例:
+    python build.py --derive 3                            # 全量编译，生成 3 个变种
+    python build.py --target HTB-Lame HTB-Blue            # 只编译指定靶机
+    python build.py --derive 5 --workers 5 --quality      # 5 线程 + 质量过滤
+    python build.py --max-sources 10 --derive 2           # 最多 10 台，每台 2 变种
+```
 
 **方式二：前端在线上传**
 

@@ -4,10 +4,11 @@
 # Project: PaperLab - AI Automated OSCP Lab Generator
 # Author: tw1t
 #
-# This project is licensed under the GNU GPLv3 License (或者 CC BY-NC 4.0).
+# This project is licensed under the GNU GPLv3 License.
 # COMMERCIAL USE IS STRICTLY PROHIBITED WITHOUT EXPLICIT PERMISSION.
 # 严禁将本项目及其 Prompt 逻辑用于任何形式的商业盈利目的！
 import os
+import sys
 import sqlite3
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -124,16 +125,52 @@ def build_pro_database(target_labs, derive_count, max_sources, enable_quality_ch
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="PaperLab 靶机数据库生成器",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""示例:
-  python build.py                          # 全量编译，默认配置
-  python build.py --target HTB-Lame HTB-Blue  # 只编译指定靶机
-  python build.py --derive 5              # 每台母体生成 5 个变种
-  python build.py --workers 5 --quality   # 5 线程并发 + 开启质量过滤
-  python build.py --max-sources 10        # 最多处理 10 台源机器
+    BANNER = r"""
+  ____                        _           _
+ |  _ \ __ _ _ __   ___ _ __| |    __ _| |__
+ | |_) / _` | '_ \ / _ \ '__| |   / _` | '_ \
+ |  __/ (_| | |_) |  __/ |  | |__| (_| | |_) |
+ |_|   \__,_| .__/ \___|_|  |_____\__,_|_.__/
+             |_|
+  ██████╗ ██╗   ██╗██╗██╗     ██████╗
+  ██╔══██╗██║   ██║██║██║     ██╔══██╗
+  ██████╔╝██║   ██║██║██║     ██║  ██║
+  ██╔══██╗██║   ██║██║██║     ██║  ██║
+  ██████╔╝╚██████╔╝██║███████╗██████╔╝
+  ╚═════╝  ╚═════╝ ╚═╝╚══════╝╚═════╝
+  Lab Compiler  -  Mutate. Derive. Pwn.
+  author: tw1t   https://github.com/cxtwit/PaperLab
 """
+
+    USAGE = """\
+  用法:
+    python build.py [参数]
+
+  参数:
+    --target  <ID> [ID ...]   只编译指定母体机器，如 HTB-Lame HTB-Blue
+    --derive  <N>             每台母体生成的变种数（默认: 3）
+    --workers <N>             并发线程数，建议不超过 5（默认: 3）
+    --max-sources <N>         最多处理的源机器数量（默认: 50）
+    --quality                 启用质量过滤，额外消耗一次 LLM 调用
+    -h, --help                显示帮助信息
+
+  示例:
+    python build.py --derive 3                            # 全量编译，生成 3 个变种
+    python build.py --target HTB-Lame HTB-Blue            # 只编译指定靶机
+    python build.py --derive 5 --workers 5 --quality      # 5 线程 + 质量过滤
+    python build.py --max-sources 10 --derive 2           # 最多 10 台，每台 2 变种
+"""
+
+    # 无参数时打印帮助后退出
+    if len(sys.argv) == 1:
+        print(BANNER)
+        print(USAGE)
+        sys.exit(0)
+
+    parser = argparse.ArgumentParser(
+        prog="build.py",
+        add_help=True,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
         "--target", nargs="*", default=[],
@@ -160,7 +197,19 @@ if __name__ == "__main__":
         help="并发线程数（默认: 3，建议不超过 5 避免 API 限速）"
     )
 
+    print(BANNER)
     args = parser.parse_args()
+
+    # 打印本次运行配置摘要
+    print("  " + "-" * 49)
+    print(f"  TARGET      : {', '.join(args.target) if args.target else 'ALL'}")
+    print(f"  DERIVE      : {args.derive} variants / source")
+    print(f"  WORKERS     : {args.workers} threads")
+    print(f"  MAX-SOURCES : {args.max_sources}")
+    print(f"  QUALITY     : {'ON' if args.quality else 'OFF'}")
+    print("  " + "-" * 49)
+    print()
+
     build_pro_database(
         target_labs=args.target,
         derive_count=args.derive,
