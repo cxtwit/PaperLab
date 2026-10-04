@@ -3,21 +3,66 @@
 #
 # PaperLab — 共用的靶机 LLM 生成逻辑
 # 供 build.py 批量编译和 main.py 上传裂变 API 共同调用
-
+#
+# Copyright 2026 tw1t
+# SPDX-License-Identifier: Apache-2.0
 import json
 import os
 import re
+import sys
+import time
+import uuid
 import random
 import sqlite3
-import sys
-import uuid
+import threading
 
-DB_FILE = "paperlab.db"
+# ==========================================
+# 0. 全局常量与配置
+# ==========================================
+
+DB_FILE = os.environ.get("PAPERLAB_DB", "paperlab.db")
 CONFIG_FILE = "config.json"
+
+# 写库串行锁：SQLite 并发写同一文件会抛 "database is locked" /
+# "attempt to write a readonly database"，且重试无法自愈。勿删。
+_DB_WRITE_LOCK = threading.RLock()
+
+# 名称占用锁。保证「检查重名 → 占用」是原子操作，
+# 避免并发线程同时通过去重判断后互相覆盖。
+_NAME_LOCK = threading.RLock()
+
+# Domain 白名单（与 Prompt 中的死锁列表保持严格一致）
+ALLOWED_DOMAINS = [
+    "Web Application",
+    "Active Directory",
+    "Network Services",
+    "Linux Privilege Escalation",
+    "Windows Privilege Escalation",
+    "Internal Network",
+    "Mixed",
+]
+
+ALLOWED_DIFFICULTIES = ["Easy", "Medium", "Hard"]
+
+# Domain 归一时使用的关键词回退表（顺序敏感，先匹配先命中）
+_DOMAIN_KEYWORD_FALLBACK = [
+    ("active directory", "Active Directory"),
+    ("kerberos", "Active Directory"),
+    ("linux privilege", "Linux Privilege Escalation"),
+    ("windows privilege", "Windows Privilege Escalation"),
+    ("privilege escalation", "Linux Privilege Escalation"),
+    ("internal network", "Internal Network"),
+    ("pivot", "Internal Network"),
+    ("network", "Network Services"),
+    ("web", "Web Application"),
+]
+
+# 喂给模型的黑名单上限（按基名计）；唯一性由 _NAME_LOCK 保证，这里只为减少无用提议。
+NAME_MEMORY_LIMIT = 200
 
 
 # ==========================================
-# 0. 共用配置加载
+# 0.5 共用配置加载
 # ==========================================
 def load_config():
     if not os.path.exists(CONFIG_FILE):
@@ -34,46 +79,88 @@ def load_config():
 
 
 # ==========================================
-# 0.5 统一数据库初始化（build.py 和 main.py 共用）
+# 0.6 统一数据库初始化（build.py 和 main.py 共用）
 # ==========================================
+def _table_names(conn):
+    return {r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'")}
+
+
+def _column_names(conn, table):
+    try:
+        return {row[1] for row in conn.execute(f'PRAGMA table_info("{table}")')}
+    except sqlite3.Error:
+        return set()
+
+
+def _migrate_schema(conn):
+    """对既有数据库做幂等的增量迁移，保证老库无需重建即可升级。"""
+    # labs.source_id：记录该变种由哪台母体裂变而来。
+    # 跳过已编译母体时以它为主判据 —— build_history 在历史库中可能为空。
+    if "labs" in _table_names(conn) and "source_id" not in _column_names(conn, "labs"):
+        conn.execute("ALTER TABLE labs ADD COLUMN source_id TEXT")
+
+
 def ensure_db(db_file=DB_FILE):
-    """确保所有表都已创建。build.py 和 main.py 启动时都调用此函数。"""
-    conn = sqlite3.connect(db_file)
-    conn.execute("PRAGMA journal_mode=WAL")
-    cursor = conn.cursor()
-    cursor.execute('''CREATE TABLE IF NOT EXISTS labs (
-        id TEXT PRIMARY KEY, os TEXT, difficulty TEXT, domain TEXT,
-        tags TEXT, context TEXT, questions TEXT, focus_points TEXT
-    )''')
-    cursor.execute('''CREATE TABLE IF NOT EXISTS submissions (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, lab_id TEXT,
-        operator_name TEXT, student_writeup TEXT, report TEXT,
-        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-    )''')
-    cursor.execute('''CREATE TABLE IF NOT EXISTS bookmarks (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, operator_name TEXT,
-        lab_id TEXT, question_text TEXT, question_focus TEXT,
-        missed_insights TEXT, feedback TEXT, score INTEGER,
-        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-    )''')
-    cursor.execute('''CREATE TABLE IF NOT EXISTS sm2_schedule (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        operator_name TEXT NOT NULL,
-        lab_id TEXT NOT NULL,
-        question_idx INTEGER NOT NULL,
-        question_text TEXT,
-        easiness REAL DEFAULT 2.5,
-        interval INTEGER DEFAULT 1,
-        repetitions INTEGER DEFAULT 0,
-        next_review DATE DEFAULT (date('now')),
-        last_score INTEGER DEFAULT 0,
-        UNIQUE(operator_name, lab_id, question_idx)
-    )''')
-    cursor.execute('''CREATE TABLE IF NOT EXISTS build_history (
-        original_name TEXT PRIMARY KEY, new_name TEXT
-    )''')
-    conn.commit()
-    conn.close()
+    """确保所有表都已创建，并补齐索引与增量迁移。"""
+    with _DB_WRITE_LOCK:
+        conn = sqlite3.connect(db_file, timeout=30)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            cursor = conn.cursor()
+            cursor.execute('''CREATE TABLE IF NOT EXISTS labs (
+                id TEXT PRIMARY KEY, os TEXT, difficulty TEXT, domain TEXT,
+                tags TEXT, context TEXT, questions TEXT, focus_points TEXT
+            )''')
+            cursor.execute('''CREATE TABLE IF NOT EXISTS submissions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, lab_id TEXT,
+                operator_name TEXT, student_writeup TEXT, report TEXT,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            )''')
+            cursor.execute('''CREATE TABLE IF NOT EXISTS bookmarks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, operator_name TEXT,
+                lab_id TEXT, question_text TEXT, question_focus TEXT,
+                missed_insights TEXT, feedback TEXT, score INTEGER,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            )''')
+            cursor.execute('''CREATE TABLE IF NOT EXISTS sm2_schedule (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                operator_name TEXT NOT NULL,
+                lab_id TEXT NOT NULL,
+                question_idx INTEGER NOT NULL,
+                question_text TEXT,
+                easiness REAL DEFAULT 2.5,
+                interval INTEGER DEFAULT 1,
+                repetitions INTEGER DEFAULT 0,
+                next_review DATE DEFAULT (date('now')),
+                last_score INTEGER DEFAULT 0,
+                UNIQUE(operator_name, lab_id, question_idx)
+            )''')
+            cursor.execute('''CREATE TABLE IF NOT EXISTS build_history (
+                original_name TEXT PRIMARY KEY, new_name TEXT
+            )''')
+            # 隔离用：记录某个代号是否设置了访问密码。
+            # pass_hash 为空表示该代号零门槛（完全向后兼容）。
+            cursor.execute('''CREATE TABLE IF NOT EXISTS operators (
+                name TEXT PRIMARY KEY,
+                pass_hash TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )''')
+
+            _migrate_schema(conn)
+            for stmt in (
+                "CREATE INDEX IF NOT EXISTS idx_submissions_operator ON submissions(operator_name)",
+                "CREATE INDEX IF NOT EXISTS idx_submissions_lab ON submissions(lab_id)",
+                "CREATE INDEX IF NOT EXISTS idx_bookmarks_operator ON bookmarks(operator_name)",
+                "CREATE INDEX IF NOT EXISTS idx_sm2_operator_due ON sm2_schedule(operator_name, next_review)",
+                "CREATE INDEX IF NOT EXISTS idx_labs_source ON labs(source_id)",
+            ):
+                cursor.execute(stmt)
+
+            conn.commit()
+        finally:
+            conn.close()
+
 
 # ==========================================
 # 1. 变异方向指令池 (Mutation Angles)
@@ -83,15 +170,16 @@ MUTATION_ANGLES = [
     "【入口变异】：改变初始立足点 (Initial Access) 的获取方式（例如将原笔记的 SQL 注入改为文件包含，或将弱口令改为反序列化），但严格保留原笔记的提权和后渗透逻辑。",
     "【提权变异】：保持原笔记的情报搜集和初始访问方式不变，但彻底改变提权 (Privilege Escalation) 的漏洞类型和利用手法。",
     "【深渊变异】：在情报搜集 (Context) 阶段，注入一个极具迷惑性的『兔子洞 (Rabbit Hole)』服务日志（如扫出了一个看起来有大洞的端口，但实际上无法利用）。将原笔记真正的突破口伪装得更加隐蔽。",
-    "【阵营反转】：如果原笔记是 Windows，请将其合理转换并重构为 Linux 靶机环境（反之亦然），但必须巧妙地保留原笔记的核心渗透思维（如：将 Windows 的 SMB 凭证泄露转换为 Linux 的 NFS 共享泄露）。"
+    "【阵营反转】：如果原笔记是 Windows，请将其合理转换并重构为 Linux 靶机环境（反之亦然），但必须巧妙地保留原笔记的核心渗透思维（如：将 Windows 的 SMB 凭证泄露转换为 Linux 的 NFS 共享泄露）。",
 ]
+
 
 # ==========================================
 # 2. Markdown 解析
 # ==========================================
 def parse_markdown_to_machines(filepath):
     """从 .md 文件中按 ## 标题提取多台靶机"""
-    with open(filepath, "r", encoding="utf-8") as f:
+    with open(filepath, "r", encoding="utf-8", errors="replace") as f:
         text = f.read()
     return parse_markdown_text_to_machines(text)
 
@@ -102,7 +190,7 @@ def parse_markdown_text_to_machines(text):
     machines = {}
     for i in range(1, len(sections), 2):
         name = sections[i].strip()
-        content = sections[i+1].strip()
+        content = sections[i + 1].strip()
         if name and content:
             original_id = f"HTB-{name}" if not name.startswith("HTB") else name
             machines[original_id] = content
@@ -113,7 +201,6 @@ def smart_truncate(text, max_chars=7000):
     """按段落边界截断文本，避免在段落中间截断"""
     if len(text) <= max_chars:
         return text
-    # 按双换行分段
     paragraphs = text.split('\n\n')
     result = []
     total = 0
@@ -122,53 +209,208 @@ def smart_truncate(text, max_chars=7000):
             break
         result.append(para)
         total += len(para) + 2
-    # 至少保留一段
     if not result:
         return text[:max_chars]
     return '\n\n'.join(result)
 
 
 # ==========================================
-# 3. 数据库操作
+# 3. 校验与归一（成品率保障）
 # ==========================================
+def normalize_domain(raw):
+    """
+    把模型给出的 domain 归一到白名单内。
+    1) 精确匹配（忽略大小写与首尾空白）直接采用规范写法；
+    2) 否则按关键词回退；
+    3) 仍无法判定则降级为 Mixed。
+    返回 (规范值, 是否发生了改写)
+    """
+    if not isinstance(raw, str) or not raw.strip():
+        return "Mixed", True
+    candidate = raw.strip()
+    for allowed in ALLOWED_DOMAINS:
+        if candidate.lower() == allowed.lower():
+            return allowed, False
+    lowered = candidate.lower()
+    for keyword, mapped in _DOMAIN_KEYWORD_FALLBACK:
+        if keyword in lowered:
+            return mapped, True
+    return "Mixed", True
+
+
+def normalize_difficulty(raw):
+    """把 difficulty 归一到三档之一。"""
+    if isinstance(raw, str):
+        candidate = raw.strip().capitalize()
+        if candidate in ALLOWED_DIFFICULTIES:
+            return candidate, False
+    return "Medium", True
+
+
+def normalize_lab_data(data):
+    """
+    对 LLM 返回的靶机数据做入库前的归一与结构校验。
+    返回 (归一后的 data, warnings: list[str])
+
+    Prompt 中的约定模型不保证遵守，因此必须有这一层确定性校验。
+    """
+    warnings = []
+
+    if not isinstance(data, dict):
+        return {}, ["返回结构不是 JSON 对象"]
+    domain, changed = normalize_domain(data.get("domain"))
+    if changed:
+        warnings.append(f"domain 「{data.get('domain')}」不在白名单内，已归一为 「{domain}」")
+    data["domain"] = domain
+    difficulty, changed = normalize_difficulty(data.get("difficulty"))
+    if changed:
+        warnings.append(f"difficulty 「{data.get('difficulty')}」非法，已归一为 「{difficulty}」")
+    data["difficulty"] = difficulty
+    os_val = data.get("os")
+    if not isinstance(os_val, str) or not os_val.strip():
+        data["os"] = "Unknown"
+        warnings.append("os 字段缺失，已置为 Unknown")
+    else:
+        data["os"] = os_val.strip()
+    tags = data.get("tags")
+    if isinstance(tags, str):
+        tags = [t.strip() for t in re.split(r'[,，]', tags) if t.strip()]
+    if not isinstance(tags, list):
+        tags = []
+        warnings.append("tags 不是数组，已置为空数组")
+    data["tags"] = [str(t).strip() for t in tags if str(t).strip()][:12]
+
+    # context 必须是纯英文终端日志，且体量合理
+    context = data.get("context")
+    if not isinstance(context, str) or len(context.strip()) < 200:
+        warnings.append("context 过短或缺失，疑似生成失败")
+        data["context"] = context if isinstance(context, str) else ""
+    else:
+        if re.search(r'[\u4e00-\u9fff]', context):
+            warnings.append("context 中混入了中文（要求为纯英文终端日志）")
+        # 尾部残留的截断提示语属于泄题红线
+        if re.search(r'(\[?\s*(断头台|截断|省略|此处省略)\s*\]?|REDACTED)', context[-300:], re.I):
+            warnings.append("context 尾部残留截断/打码提示语，违反无痕截断要求")
+        data["context"] = context
+    questions = data.get("questions")
+    if not isinstance(questions, list):
+        questions = []
+        warnings.append("questions 不是数组，已置为空数组")
+    cleaned_q = []
+    for q in questions:
+        if isinstance(q, dict) and isinstance(q.get("text"), str) and q["text"].strip():
+            cleaned_q.append({
+                "text": q["text"].strip(),
+                "focus": (q.get("focus") or "").strip() if isinstance(q.get("focus"), str) else "",
+            })
+    data["questions"] = cleaned_q
+    if len(cleaned_q) < 3:
+        warnings.append(f"题目数量 {len(cleaned_q)} 少于要求的 3 道")
+    for q in cleaned_q:
+        if re.match(r'^\s*(任务|问题|Question)\s*0?\d+\s*[:：.、]', q["text"]):
+            warnings.append("题目正文带有编号前缀，会与前端自动编号重复")
+            break
+    focus = data.get("focus_points")
+    if isinstance(focus, str) and focus.strip():
+        data["focus_points"] = focus.strip()
+    elif isinstance(focus, list):
+        data["focus_points"] = "\n".join(
+            f"{i}. {str(x).strip()}" for i, x in enumerate(focus, 1) if str(x).strip())
+    else:
+        data["focus_points"] = ""
+        warnings.append("focus_points 缺失")
+
+    # questions 与 focus_points 应 1:1 对应（Prompt 明确要求）
+    pts = len(re.findall(r'^\s*\d+[\.、]', data["focus_points"], flags=re.MULTILINE))
+    if pts and cleaned_q and pts != len(cleaned_q):
+        warnings.append(f"题目数({len(cleaned_q)}) 与考点数({pts}) 不满足 1:1")
+    name = data.get("machine_name")
+    if not isinstance(name, str) or not name.strip():
+        data["machine_name"] = ""
+        warnings.append("machine_name 缺失")
+    else:
+        data["machine_name"] = name.strip()
+
+    return data, warnings
+
+
+# ==========================================
+# 4. 数据库操作
+# ==========================================
+def get_db(db_file=DB_FILE):
+    conn = sqlite3.connect(db_file, timeout=30)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
 def get_all_used_machine_names(db_file=DB_FILE):
     """获取数据库中所有已有靶机名"""
     try:
-        conn = sqlite3.connect(db_file)
-        cursor = conn.cursor()
-        cursor.execute("SELECT id FROM labs")
-        rows = cursor.fetchall()
-        conn.close()
-        return [row[0] for row in rows]
-    except Exception:
+        conn = get_db(db_file)
+        try:
+            return [row[0] for row in conn.execute("SELECT id FROM labs")]
+        finally:
+            conn.close()
+    except sqlite3.Error:
         return []
 
 
-def save_lab_to_db(history_id, data, db_file=DB_FILE):
-    """将生成的靶机写入数据库"""
+def get_difficulty_distribution(db_file=DB_FILE):
+    """统计当前库内的难度分布，用于在 Prompt 中提示模型补齐缺失档位。"""
+    try:
+        conn = get_db(db_file)
+        try:
+            rows = conn.execute(
+                "SELECT difficulty, COUNT(*) FROM labs GROUP BY difficulty").fetchall()
+            dist = {d: 0 for d in ALLOWED_DIFFICULTIES}
+            for d, n in rows:
+                if d in dist:
+                    dist[d] = n
+            return dist
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return {d: 0 for d in ALLOWED_DIFFICULTIES}
+
+
+def save_lab_to_db(history_id, data, db_file=DB_FILE, source_id=None):
+    """
+    将生成的靶机写入数据库。
+
+    注意：本函数会被批量编译的多线程并发调用，因此内部串行化。
+    它不得被包进「调用 LLM 的重试块」里——写库失败只应重试写库，
+    绝不能因此重新调用一次计费模型。
+    """
     new_machine_name = data.get('machine_name', history_id)
-    conn = sqlite3.connect(db_file)
-    cursor = conn.cursor()
-    cursor.execute(
-        '''INSERT OR REPLACE INTO labs (id, os, difficulty, domain, tags, context, questions, focus_points)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
-        (
-            new_machine_name,
-            data.get('os', 'Unknown'),
-            data.get('difficulty', 'Medium'),
-            data.get('domain', 'General'),
-            json.dumps(data.get('tags', []), ensure_ascii=False),
-            data['context'],
-            json.dumps(data['questions'], ensure_ascii=False),
-            data['focus_points']
-        )
-    )
-    cursor.execute(
-        '''INSERT OR REPLACE INTO build_history (original_name, new_name) VALUES (?, ?)''',
-        (history_id, new_machine_name)
-    )
-    conn.commit()
-    conn.close()
+    with _DB_WRITE_LOCK:
+        conn = sqlite3.connect(db_file, timeout=30)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            cursor = conn.cursor()
+            cursor.execute(
+                '''INSERT OR REPLACE INTO labs
+                   (id, os, difficulty, domain, tags, context, questions, focus_points, source_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                (
+                    new_machine_name,
+                    data.get('os', 'Unknown'),
+                    data.get('difficulty', 'Medium'),
+                    data.get('domain', 'General'),
+                    json.dumps(data.get('tags', []), ensure_ascii=False),
+                    data['context'],
+                    json.dumps(data['questions'], ensure_ascii=False),
+                    data['focus_points'],
+                    source_id,
+                )
+            )
+            cursor.execute(
+                '''INSERT OR REPLACE INTO build_history (original_name, new_name)
+                   VALUES (?, ?)''',
+                (history_id, new_machine_name)
+            )
+            conn.commit()
+        finally:
+            conn.close()
     return new_machine_name
 
 
@@ -181,19 +423,59 @@ def deduplicate_name(name, used_names):
             return name
         base = original.split('-')[0]
         name = f"{base}-{suffix}"
-    # 全部后缀碰撞，使用 UUID 短串兜底，保证不重复
     if name in used_names:
         base = original.split('-')[0]
         name = f"{base}-{uuid.uuid4().hex[:6].upper()}"
     return name
 
 
+def reserve_machine_name(proposed, used_names, db_file=DB_FILE):
+    """
+    原子地为一个变种占下一个唯一名字。
+
+    原实现是 deduplicate_name(检查) 与 used_names.append(占用) 两步分离，
+    且在 quality_check 开启时会隔着一次秒级 LLM 调用，并发下两个线程
+    可同时通过检查，随后 INSERT OR REPLACE 让后者静默覆盖前者。
+    这里把「检查 + 占用」合并进同一把锁。
+    """
+    with _NAME_LOCK:
+        # 以数据库为准重新同步一次，避免多次运行之间失配
+        pool = set(used_names) | set(get_all_used_machine_names(db_file))
+        name = deduplicate_name(proposed or "Phantom", pool)
+        used_names.append(name)
+        return name
+
+
+def release_machine_name(name, used_names):
+    """写库失败时回滚已占用的名字，避免名字被虚占。"""
+    with _NAME_LOCK:
+        while name in used_names:
+            used_names.remove(name)
+
+
 # ==========================================
-# 4. 构建 LLM Prompt
+# 5. 构建 LLM Prompt
 # ==========================================
-def build_mutation_prompt(wp_text, mutation_angle, used_names_list):
+def build_mutation_prompt(wp_text, mutation_angle, used_names_list, difficulty_hint=None):
     """构建靶机生成的 system prompt"""
-    used_names_str = ", ".join(used_names_list[-20:]) if used_names_list else "无"
+    # 只喂基名：需避免的是基名重复，比喂全量变体名更省 token。
+    base_names = []
+    for n in (used_names_list or [])[-NAME_MEMORY_LIMIT:]:
+        base = str(n).split('-')[0]
+        if base and base not in base_names:
+            base_names.append(base)
+    used_names_str = ", ".join(base_names) if base_names else "无"
+
+    difficulty_block = ""
+    if difficulty_hint:
+        total = sum(difficulty_hint.values()) or 0
+        dist_str = " / ".join(f"{d} {difficulty_hint.get(d, 0)}" for d in ALLOWED_DIFFICULTIES)
+        difficulty_block = (
+            f"\n    # 📊 当前题库难度分布（用于保持三档均衡）\n"
+            f"    现有 {total} 台，分布为：{dist_str}。\n"
+            f"    请优先考虑把本台评定为当前**数量最少**的那一档，以维持 Easy / Medium / Hard "
+            f"的均衡；但若情报本身明显偏向某一档，仍应诚实评定，不要为了配额而虚报。\n"
+        )
 
     system_prompt = f"""
     # Role
@@ -208,14 +490,16 @@ def build_mutation_prompt(wp_text, mutation_angle, used_names_list):
     # 💎 极客命名死锁法则 (CRITICAL NAMING RULE)
     1. 必须基于变异后的核心漏洞起一个【极客感十足、隐喻性强的单词/双词代号】（风格参考 HackTheBox，如：Phantom, Goliath, Mirage, Bloodline）。绝对禁止使用 "Corp-Server-01" 这种枯燥的编号！
     2. ⚠️ 绝对禁止在名字中包含任何版本号、数字或下划线（严禁出现 -v2, _v1, 01 等字眼）！
-    3. ⚠️ 记忆黑名单：为了防止重复，你本次起的名字绝对不能是以下已被占用的名字：[{used_names_str}]。必须想一个全新的！
+    3. ⚠️ 记忆黑名单（以下**基名**已被占用，禁止再次使用）：[{used_names_str}]。
+       注意：系统会在你之后自动追加去重后缀，所以**请务必提出一个全新的基名**，
+       而不是依赖系统帮你改名。全新基名是硬性要求。
 
     # Requirements (严苛的纸上演练逻辑 - 黄金准则)
     1. 身份识别：识别变异后新靶机的 OS、难度、技术标签，以及所属的领域 (Domain)。
        ⚠️ Domain 死锁：domain 字段必须且只能从以下固定列表中选择一个，禁止自造新名称：
        [ "Web Application", "Active Directory", "Network Services", "Linux Privilege Escalation", "Windows Privilege Escalation", "Internal Network", "Mixed" ]
        ⚠️ Difficulty 死锁：difficulty 字段必须且只能填写 "Easy"、"Medium"、"Hard" 三者之一。请根据变异后的靶机复杂度诚实判断，三档都应该被使用到，不要全部填 Medium。
-
+       {difficulty_block}
     2. 📜 绝对原始回显伪造 (对抗大白话与脏字符清洗)：
        - 致命错误：用一句中文大白话总结扫描结果！绝对禁止！
        - 必须为新靶机亲手**伪造出原汁原味的纯英文终端格式日志**（如 Nmap, Gobuster, smbclient 等）。
@@ -267,7 +551,10 @@ def build_mutation_prompt(wp_text, mutation_angle, used_names_list):
 def build_user_prompt(wp_text):
     """构建靶机生成的 user prompt"""
     truncated = smart_truncate(wp_text, max_chars=7000)
-    return f"请提取考点并基于以下母体笔记进行变异衍生。强制：伪造英文终端日志(结尾绝对不写总结/不留提示语)、中文提问(无编号前缀)、至少3题、起个极客名字。严格无痕截断！WP 内容：\n\n{truncated}"
+    return (f"请提取考点并基于以下母体笔记进行变异衍生。强制：伪造英文终端日志"
+            f"(结尾绝对不写总结/不留提示语)、中文提问(无编号前缀)、至少3题、"
+            f"起一个全新的极客基名、domain/difficulty 只能取指定白名单值。严格无痕截断！"
+            f"WP 内容：\n\n{truncated}")
 
 
 def clean_and_parse_json(raw_json_str):
@@ -277,9 +564,10 @@ def clean_and_parse_json(raw_json_str):
 
 
 # ==========================================
-# 5. 质量评分过滤
+# 6. 质量评分过滤
 # ==========================================
 QUALITY_MIN_SCORE = 6  # 低于此分的靶机不入库
+
 
 def build_quality_check_prompt():
     """构建质量评分的 system prompt"""
@@ -297,16 +585,25 @@ def build_quality_check_prompt():
 def quality_check(client, model, lab_data):
     """对生成的靶机进行质量评分，返回 (score, issues)"""
     try:
-        resp = client.chat.completions.create(
-            model=model,
-            messages=[
+        kwargs = {
+            "model": model,
+            "messages": [
                 {"role": "system", "content": build_quality_check_prompt()},
                 {"role": "user", "content": json.dumps(lab_data, ensure_ascii=False)[:4000]}
             ],
-            temperature=0.1,
-            max_tokens=500,
-            response_format={"type": "json_object"}
-        )
+            "temperature": 0.1,
+            "max_tokens": 500,
+        }
+        kwargs.update(_json_mode_arg())
+        try:
+            resp = client.chat.completions.create(**kwargs)
+        except Exception as e:
+            # 端点在本次运行中首次暴露「不支持 response_format」时降级重试一次
+            if _response_format_rejected(e) and _disable_json_mode():
+                kwargs.pop("response_format", None)
+                resp = client.chat.completions.create(**kwargs)
+            else:
+                raise
         result = clean_and_parse_json(resp.choices[0].message.content)
         return result.get("quality_score", 0), result.get("issues", [])
     except Exception as e:
@@ -314,58 +611,151 @@ def quality_check(client, model, lab_data):
         return 10, []  # 评分失败时放行
 
 
-def generate_single_variant(client, model, wp_text, original_id, variant_idx, global_used_names, db_file=DB_FILE, enable_quality_check=True):
+# ==========================================
+# 7. 单变种生成（核心）
+# ==========================================
+# 服务商下线或改名模型时，报错文案各不相同
+# （DeepSeek 旧版为 "Model Not Exist"，OpenAI 为 "The model `x` does not exist"），
+# 统一翻译成可操作的指引，避免用户对着 400 发懵。
+_MODEL_GONE_HINTS = (
+    "model not exist", "model_not_found", "model not found",
+    "does not exist", "unknown model", "invalid model",
+    "no such model", "unsupported model", "not a valid model",
+)
+
+
+# 并非所有 OpenAI 兼容端点都接受 response_format={"type":"json_object"}：
+# 部分服务商/兼容层会以 400 直接拒绝（如 Anthropic 的兼容层报
+# "response_format: Extra inputs are not permitted"），另有部分会静默忽略。
+# 首次遇到「被拒绝」时自动降级为不携带该参数重试，并在此后不再携带 ——
+# JSON 结构仍由 Prompt 约束 + clean_and_parse_json 兜底。
+# 被拒绝的请求返回 400、不消耗 token，因此这个降级不产生额外费用。
+_JSON_MODE_SUPPORTED = True
+
+
+def _response_format_rejected(err):
+    low = str(err).lower()
+    return "response_format" in low or "json_object" in low
+
+
+def _disable_json_mode():
+    """
+    关闭 JSON 模式，返回「本次调用是否真的发生了状态变化」（幂等）。
+
+    返回值用于调用方判断是否值得再试一次 —— 也避免因错误文案重复命中
+    而陷入无限重试。
+    """
+    global _JSON_MODE_SUPPORTED
+    changed = _JSON_MODE_SUPPORTED
+    _JSON_MODE_SUPPORTED = False
+    return changed
+
+
+def _json_mode_arg():
+    """需要时返回 response_format 参数字典，否则返回空字典。"""
+    return {"response_format": {"type": "json_object"}} if _JSON_MODE_SUPPORTED else {}
+
+
+def _explain_llm_error(msg):
+    low = str(msg).lower()
+    if any(h in low for h in _MODEL_GONE_HINTS):
+        return (f"{msg}\n     → 配置的模型名可能已失效（服务商已下线或改名）。"
+                f"请重新运行 python setup.py，从当前可用模型列表中选择。")
+    return msg
+
+
+def _generate_raw_variant(client, model, wp_text, original_id, variant_idx,
+                          used_names, difficulty_hint):
+    """
+    阶段一：调用 LLM 并解析出结构化数据。
+
+    只重试「模型调用 + JSON 解析」——这两步计费，但重试它们本身有意义
+    （针对模型偶发的格式错误）。任何数据库/文件系统操作都不得出现在本函数内。
+    """
+    current_mutation = random.choice(MUTATION_ANGLES)
+    system_prompt = build_mutation_prompt(wp_text, current_mutation, used_names, difficulty_hint)
+    user_prompt = build_user_prompt(wp_text)
+
+    last_error = "未知错误"
+    attempts = 0
+    while attempts < 3:
+        kwargs = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            "temperature": 0.7,
+            "max_tokens": 4000,
+        }
+        kwargs.update(_json_mode_arg())
+        try:
+            response = client.chat.completions.create(**kwargs)
+            return clean_and_parse_json(response.choices[0].message.content), None
+        except json.JSONDecodeError:
+            attempts += 1
+            last_error = "JSON 格式错误"
+        except Exception as e:
+            if _response_format_rejected(e) and _disable_json_mode():
+                continue                  # 刚降级，用不带 response_format 的参数重试
+            attempts += 1
+            last_error = _explain_llm_error(f"生成异常: {str(e)}")
+    return None, f"{last_error}（已重试 3 次）"
+
+
+def generate_single_variant(client, model, wp_text, original_id, variant_idx,
+                            global_used_names, db_file=DB_FILE, enable_quality_check=True):
     """
     生成单个变种靶机。供 build.py 和上传 API 共同调用。
 
     返回: (success: bool, machine_name: str | None, lab_data: dict | None, error: str | None)
+
+    「LLM 阶段」与「持久化阶段」必须各自重试。
+    若把 save_lab_to_db 并入 LLM 所在的 try 块，写库失败会连带重新调用一次
+    计费模型（多线程写 SQLite 有概率失败），而第一份产出被丢弃。
     """
-    current_mutation = random.choice(MUTATION_ANGLES)
     variant_history_id = f"{original_id}_v{variant_idx}"
 
-    used_names_str_list = list(global_used_names[-20:]) if global_used_names else []
+    # ---------- 阶段一：LLM 生成（计费，失败才重试） ----------
+    difficulty_hint = get_difficulty_distribution(db_file)
+    raw_data, err = _generate_raw_variant(
+        client, model, wp_text, original_id, variant_idx,
+        list(global_used_names), difficulty_hint
+    )
+    if raw_data is None:
+        return False, None, None, err
 
-    system_prompt = build_mutation_prompt(wp_text, current_mutation, used_names_str_list)
-    user_prompt = build_user_prompt(wp_text)
+    # ---------- 阶段二：归一与校验（本地，零成本） ----------
+    lab_data, warnings = normalize_lab_data(raw_data)
+    if not lab_data.get("context") or not lab_data.get("questions"):
+        return False, None, lab_data, "归一后缺少 context 或 questions，判为无效产出"
+    for w in warnings:
+        print(f"   ℹ️ [{original_id} v{variant_idx}] 归一提示: {w}")
 
-    max_retries = 3
-    for attempt in range(max_retries):
+    # ---------- 阶段三：质量评分（可选，计费） ----------
+    if enable_quality_check:
+        score, issues = quality_check(client, model, lab_data)
+        if score < QUALITY_MIN_SCORE:
+            return False, None, lab_data, f"质量评分 {score}/10 未达标: {', '.join(issues)}"
+
+    # ---------- 阶段四：原子占名（本地） ----------
+    proposed = lab_data.get("machine_name") or "Phantom"
+    new_name = reserve_machine_name(proposed, global_used_names, db_file)
+    lab_data["machine_name"] = new_name
+
+    # ---------- 阶段五：写库（本地；失败只重试写库，绝不重调模型） ----------
+    last_db_error = None
+    for w_attempt in range(3):
         try:
-            response = client.chat.completions.create(
-                model=model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt}
-                ],
-                temperature=0.7,
-                max_tokens=4000,
-                response_format={"type": "json_object"}
-            )
-
-            lab_data = clean_and_parse_json(response.choices[0].message.content)
-
-            # 防名称碰撞
-            ai_name = lab_data.get('machine_name', 'Phantom')
-            ai_name = deduplicate_name(ai_name, global_used_names)
-            lab_data['machine_name'] = ai_name
-
-            # 质量评分过滤
-            if enable_quality_check:
-                score, issues = quality_check(client, model, lab_data)
-                if score < QUALITY_MIN_SCORE:
-                    return False, None, lab_data, f"质量评分 {score}/10 未达标: {', '.join(issues)}"
-
-            # 写入数据库
-            global_used_names.append(ai_name)
-            new_name = save_lab_to_db(variant_history_id, lab_data, db_file)
-
-            return True, new_name, lab_data, None
-
-        except json.JSONDecodeError:
-            if attempt == max_retries - 1:
-                return False, None, None, f"JSON 格式错误（已重试 {max_retries} 次）"
+            saved = save_lab_to_db(variant_history_id, lab_data, db_file, source_id=original_id)
+            return True, saved, lab_data, None
+        except sqlite3.Error as e:
+            last_db_error = f"写库失败({type(e).__name__}): {e}"
+            time.sleep(0.3 * (w_attempt + 1))
         except Exception as e:
-            if attempt == max_retries - 1:
-                return False, None, None, f"生成异常: {str(e)}"
+            last_db_error = f"写库异常: {e}"
+            break
 
-    return False, None, None, "未知错误"
+    # 写库彻底失败：把名字还回去，避免虚占
+    release_machine_name(new_name, global_used_names)
+    return False, None, lab_data, last_db_error or "写库失败"
