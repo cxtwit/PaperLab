@@ -3,8 +3,11 @@
 <head>
     <meta charset="UTF-8">
     <title>OSCP 纸上推演训练系统</title>
-    <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
-    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Vue 本地化并锁版本：渲染框架必须离线可用，勿改回外链 CDN -->
+    <script src="/static/vue.global.prod.js"></script>
+    <!-- Tailwind 保留 CDN 但锁定版本（其 CDN 为运行时 JIT，无法简单静态化）。
+         它只负责样式，不可达时页面结构与功能仍然完整。 -->
+    <script src="https://cdn.tailwindcss.com/3.4.17"></script>
     <style>
         @import url('https://fonts.loli.net/css2?family=Inter:wght@400;500;600;700&family=Fira+Code:wght@400;500;700&display=swap');
 
@@ -110,11 +113,25 @@
                             <span style="color: var(--oscp-green)">OSCP</span> <span class="text-white">Paper Lab</span>
                         </h1>
                         <p class="text-center text-[#8b949e] text-sm mb-10">输入特工代号以接入推演终端。</p>
-                        <div class="mb-8">
+                        <div class="mb-4">
                             <label class="block text-[#8b949e] text-xs mb-2 font-medium">特工代号 (Operator Handle)</label>
                             <input v-model="tempName" @keyup.enter="login" type="text" class="w-full bg-[#0d1117] border border-[#5cb85c] rounded-md p-3 text-white text-center tracking-widest focus:outline-none focus:ring-1 focus:ring-[#5cb85c]" placeholder="hack3r">
                         </div>
-                        <button @click="login" class="pro-btn w-full py-3 mb-8 text-sm tracking-wide">初始化会话 (Initialize Session)</button>
+                        <div class="mb-6">
+                            <label class="block text-[#8b949e] text-xs mb-2 font-medium">
+                                访问口令 <span style="color:#5f6a76">(选填 · Optional)</span>
+                            </label>
+                            <input v-model="tempPass" @keyup.enter="login" type="password" autocomplete="new-password" class="w-full bg-[#0d1117] border border-[#30363d] rounded-md p-3 text-white text-center tracking-widest focus:outline-none focus:ring-1 focus:ring-[#5cb85c]" placeholder="留空即无需口令">
+                            <p class="text-[10px] text-[#8b949e] mt-2 leading-relaxed">
+                                代号多人共用时可设口令做隔离：首次为该代号填入的口令即为启用；
+                                留空则任何人都能以该代号进入。
+                            </p>
+                        </div>
+                        <button @click="login" :disabled="loggingIn" class="pro-btn w-full py-3 text-sm tracking-wide disabled:opacity-60">
+                            {{ loggingIn ? '正在校验…' : '初始化会话 (Initialize Session)' }}
+                        </button>
+                        <p v-if="loginError" class="text-red-400 text-[11px] text-center mt-4">{{ loginError }}</p>
+                        <div class="mt-8"></div>
                         <div class="border-t border-[#30363d] pt-6 text-center">
                             <p class="text-[10px] text-[#8b949e] mono uppercase tracking-widest mb-1">SECURE TERMINAL ACCESS</p>
                         </div>
@@ -628,6 +645,11 @@
             setup() {
                 const operatorName = ref(localStorage.getItem('paperlab_user') || '');
                 const tempName = ref('');
+                // 口令只放 sessionStorage：关闭浏览器即清除，避免明文口令长期留在磁盘上。
+                const tempPass = ref(sessionStorage.getItem('paperlab_pass') || '');
+                const loginError = ref('');
+                const loggingIn = ref(false);
+                const filters = ref({ domains: [], difficulties: [] });
                 const labs = ref([]);
                 const doneLabIds = ref(new Set());
                 const currentLabId = ref(null);
@@ -706,10 +728,62 @@
 
                 const stopTimer = () => { clearInterval(timerInterval); timerInterval = null; };
 
-                const login = () => { if(tempName.value.trim()) { operatorName.value = tempName.value.trim(); localStorage.setItem('paperlab_user', operatorName.value); initSession(); } }
+                // 统一附带口令头；未设口令的代号服务端直接放行，不影响原有用法
+                const authHeaders = (extra = {}) => {
+                    const h = { ...extra };
+                    if (tempPass.value) h['X-Operator-Pass'] = tempPass.value;
+                    return h;
+                };
+
+                // 服务端 403 表示该代号已受口令保护而当前凭据不对，踢回登录页
+                const handleAuthFailure = (res) => {
+                    if (res && res.status === 403) {
+                        operatorName.value = '';
+                        localStorage.removeItem('paperlab_user');
+                        loginError.value = '该代号已启用口令保护，请重新输入口令接入。';
+                        return true;
+                    }
+                    return false;
+                };
+
+                const login = async () => {
+                    const name = tempName.value.trim();
+                    if (!name) { loginError.value = '请输入特工代号。'; return; }
+                    loggingIn.value = true;
+                    loginError.value = '';
+                    try {
+                        const res = await fetch('/api/auth', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ name: name, password: tempPass.value || null })
+                        });
+                        if (!res.ok) {
+                            const err = await res.json().catch(() => ({}));
+                            loginError.value = err.detail || '接入失败，请检查代号与口令。';
+                            return;
+                        }
+                        const data = await res.json();
+                        operatorName.value = name;
+                        localStorage.setItem('paperlab_user', name);
+                        if (tempPass.value) sessionStorage.setItem('paperlab_pass', tempPass.value);
+                        else sessionStorage.removeItem('paperlab_pass');
+                        if (data.mode === 'protected') {
+                            loginError.value = '已为该代号启用口令保护。';
+                        }
+                        initSession();
+                    } catch (e) {
+                        loginError.value = '无法连接服务，请确认后端已启动。';
+                    } finally {
+                        loggingIn.value = false;
+                    }
+                }
+
                 const logout = () => {
                     operatorName.value = '';
+                    tempPass.value = '';
+                    loginError.value = '';
                     localStorage.removeItem('paperlab_user');
+                    sessionStorage.removeItem('paperlab_pass');
                     historyPage.value = 1;
                     history.value = [];
                     historyTotal.value = 0;
@@ -722,7 +796,14 @@
                     window.scrollTo(0,0);
                 }
 
-                const uniqueDomains = computed(() => [...new Set(labs.value.map(l => l.domain).filter(d => d))]);
+                // 优先用 /api/filters 下发的白名单，避免库中脏值把下拉拆成碎片；
+                // 接口不可用时退回按现有靶机列表推导。
+                const uniqueDomains = computed(() => {
+                    if (filters.value.domains && filters.value.domains.length) {
+                        return filters.value.domains;
+                    }
+                    return [...new Set(labs.value.map(l => l.domain).filter(d => d))].sort();
+                });
 
                 // doneLabIds 现在是从 /api/done_labs 拉取的完整集合（ref，非 computed）
                 const parsedSections = computed(() => {
@@ -743,13 +824,20 @@
                     try {
                         const [lRes, hRes, sRes, bRes, sm2sRes, doneRes] = await Promise.all([
                             fetch('/api/list_labs'),
-                            fetch(`/api/history?username=${encodeURIComponent(operatorName.value)}&page=1&page_size=15`),
-                            fetch(`/api/stats?username=${encodeURIComponent(operatorName.value)}`),
-                            fetch(`/api/bookmarks?username=${encodeURIComponent(operatorName.value)}`),
-                            fetch(`/api/sm2/stats?username=${encodeURIComponent(operatorName.value)}`),
-                            fetch(`/api/done_labs?username=${encodeURIComponent(operatorName.value)}`),
+                            fetch(`/api/history?username=${encodeURIComponent(operatorName.value)}&page=1&page_size=15`, { headers: authHeaders() }),
+                            fetch(`/api/stats?username=${encodeURIComponent(operatorName.value)}`, { headers: authHeaders() }),
+                            fetch(`/api/bookmarks?username=${encodeURIComponent(operatorName.value)}`, { headers: authHeaders() }),
+                            fetch(`/api/sm2/stats?username=${encodeURIComponent(operatorName.value)}`, { headers: authHeaders() }),
+                            fetch(`/api/done_labs?username=${encodeURIComponent(operatorName.value)}`, { headers: authHeaders() }),
                         ]);
+                        for (const r of [hRes, sRes, bRes, sm2sRes, doneRes]) {
+                            if (handleAuthFailure(r)) return;
+                        }
                         labs.value = await lRes.json();
+                        try {
+                            const fRes = await fetch('/api/filters');
+                            if (fRes.ok) filters.value = await fRes.json();
+                        } catch (e) { /* 忽略，使用兜底逻辑 */ }
                         const hData = await hRes.json();
                         history.value = hData.items;
                         historyTotal.value = hData.total;
@@ -763,7 +851,8 @@
                 const loadMoreHistory = async () => {
                     historyPage.value += 1;
                     try {
-                        const res = await fetch(`/api/history?username=${encodeURIComponent(operatorName.value)}&page=${historyPage.value}&page_size=15`);
+                        const res = await fetch(`/api/history?username=${encodeURIComponent(operatorName.value)}&page=${historyPage.value}&page_size=15`, { headers: authHeaders() });
+                        if (handleAuthFailure(res)) return;
                         const data = await res.json();
                         history.value = [...history.value, ...data.items];
                     } catch(e) { console.error(e); }
@@ -774,7 +863,8 @@
                 // ==========================================
                 const loadSm2Today = async () => {
                     try {
-                        const res = await fetch(`/api/sm2/today?username=${encodeURIComponent(operatorName.value)}`);
+                        const res = await fetch(`/api/sm2/today?username=${encodeURIComponent(operatorName.value)}`, { headers: authHeaders() });
+                        if (handleAuthFailure(res)) return;
                         sm2Today.value = await res.json();
                         sm2CurrentIdx.value = 0;
                         sm2Answer.value = '';
@@ -789,7 +879,7 @@
                     try {
                         await fetch('/api/sm2/review', {
                             method: 'POST',
-                            headers: { 'Content-Type': 'application/json' },
+                            headers: authHeaders({ 'Content-Type': 'application/json' }),
                             body: JSON.stringify({
                                 username: operatorName.value,
                                 lab_id: card.lab_id,
@@ -801,7 +891,7 @@
                         sm2Answer.value = '';
                         if (sm2CurrentIdx.value + 1 >= sm2Today.value.length) {
                             sm2Done.value = true;
-                            const sRes = await fetch(`/api/sm2/stats?username=${encodeURIComponent(operatorName.value)}`);
+                            const sRes = await fetch(`/api/sm2/stats?username=${encodeURIComponent(operatorName.value)}`, { headers: authHeaders() });
                             sm2Stats.value = await sRes.json();
                         } else {
                             sm2CurrentIdx.value++;
@@ -899,9 +989,10 @@
                     try {
                         const combined = currentLab.value.questions.map((q, i) => `[推演任务: ${q.text}]\n学生回答: ${studentAnswers.value[i]}`).join('\n\n');
                         const res = await fetch('/api/evaluate', {
-                            method: 'POST', headers: { 'Content-Type': 'application/json' },
+                            method: 'POST', headers: authHeaders({ 'Content-Type': 'application/json' }),
                             body: JSON.stringify({ lab_id: currentLabId.value, username: operatorName.value, answers: { "student_writeup": combined } })
                         });
+                        if (handleAuthFailure(res)) return;
                         report.value = await res.json(); await initSession();
                         setTimeout(() => document.getElementById('report-anchor').scrollIntoView({ behavior: 'smooth', block: 'start' }), 300);
                     } catch(e) { alert("AI Evaluation Failed."); } finally { loading.value = false; }
@@ -914,7 +1005,7 @@
                     if (!fb) return;
                     try {
                         await fetch('/api/bookmarks', {
-                            method: 'POST', headers: { 'Content-Type': 'application/json' },
+                            method: 'POST', headers: authHeaders({ 'Content-Type': 'application/json' }),
                             body: JSON.stringify({
                                 username: operatorName.value,
                                 lab_id: currentLabId.value,
@@ -926,13 +1017,13 @@
                             })
                         });
                         savedBookmarks.value = new Set([...savedBookmarks.value, idx]);
-                        bookmarks.value = await (await fetch(`/api/bookmarks?username=${encodeURIComponent(operatorName.value)}`)).json();
+                        bookmarks.value = await (await fetch(`/api/bookmarks?username=${encodeURIComponent(operatorName.value)}`, { headers: authHeaders() })).json();
                     } catch(e) { alert("收藏失败，请重试。"); }
                 }
 
                 const deleteBookmark = async (id) => {
                     try {
-                        await fetch(`/api/bookmarks/${id}?username=${encodeURIComponent(operatorName.value)}`, { method: 'DELETE' });
+                        await fetch(`/api/bookmarks/${id}?username=${encodeURIComponent(operatorName.value)}`, { method: 'DELETE', headers: authHeaders() });
                         bookmarks.value = bookmarks.value.filter(b => b.id !== id);
                     } catch(e) { alert("删除失败。"); }
                 }
@@ -964,7 +1055,7 @@
                 onUnmounted(() => stopTimer());
 
                 return {
-                    operatorName, tempName, labs, currentLabId, currentLab, studentAnswers, history, loading, report, matchError, filter,
+                    operatorName, tempName, tempPass, loginError, loggingIn, labs, currentLabId, currentLab, studentAnswers, history, loading, report, matchError, filter,
                     uniqueDomains, parsedSections, getFeedback, login, logout, backToDashboard, generateRandomLab, retryLab, submitSolution,
                     dashTab, stats, bookmarks, savedBookmarks, saveBookmark, deleteBookmark, exportBookmarks,
                     timedMode, timerCurrentQ, timerPct, timerDisplay,
