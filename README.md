@@ -2,9 +2,8 @@
 
 > "纸上得来亦不浅，赛博沙盘定乾坤。"
 
-![License](https://img.shields.io/badge/License-GPLv3-blue.svg)
+![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)
 ![Python](https://img.shields.io/badge/Python-3.8%2B-green.svg)
-![AI Powered](https://img.shields.io/badge/AI-DeepSeek-red.svg)
 
 ### 项目简介
 
@@ -42,22 +41,31 @@ LLM模型批阅：
 
 ### 核心特性
 
-* **多维度环境变异 (Context Mutation)**：支持端口替换、入口点变更、提权手法替换、假情报注入（Rabbit Hole）以及 OS 类型反转。基于同一份母体笔记，可生成多条截然不同的攻击路径。
-* **高仿真终端日志伪造**：拒绝大白话总结。强制输出纯英文终端原生日志格式（如 Nmap, Gobuster, smbclient 等），并真实还原明文凭据和扫描特征。
-* **攻击链无痕截断**：在情报搜集阶段精准截断，保留推演悬念，绝不泄露后续的漏洞利用和提权步骤。
-* **SM-2 间隔重复复盘**：基于 SM-2 算法根据答题质量自动调度复盘间隔，支持卡片式作答与三档自评（不会 / 模糊 / 掌握），精准攻克薄弱考点。
-* **LLM 容错与自动重试机制**：针对大模型偶发的 JSON 格式化错误，底层架构内置了 3 次自愈重试机制，保障批量生成时的健壮性。
-* **动态靶机命名与防冲突**：内置历史字典黑名单，动态生成类似 `Spectre`, `Obsidian` 等代号，避免数据库记录碰撞与覆写。
-* **Domain 分类 + Difficulty 三档**：每台靶机自动归类至 Web、Active Directory、Privilege Escalation 等安全领域，并标注 Easy / Medium / Hard 难度，支持前端多维度筛选。
-* **错题本系统**：用户可将答错或薄弱的考题一键收藏，随时回顾考官评语与核心知识点；支持一键导出为 Markdown 文件离线复习。
-* **个人统计面板**：自动汇总历史战报，按 Domain / Tag 维度输出平均得分趋势图，精准定位技术短板。
-* **全平台排行榜**：实时聚合所有用户的平均分与推演次数，按综合排名展示，适合团队共同训练竞技。
-* **并发靶机生成**：批量编译时支持多线程并发调用 LLM，速度提升约 3 倍；同时支持 CLI 参数灵活控制编译目标、变种数和线程数。
-* **多用户隔离**：支持多人共用同一服务实例，历史战报、错题本与统计数据均按 Nick Name 独立隔离。
+**靶机生成**
+
+* **多维度环境变异**：支持端口替换、入口点变更、提权手法替换、假情报注入（Rabbit Hole）以及 OS 类型反转。基于同一份母体笔记，可生成多条截然不同的攻击路径。
+* **高仿真终端日志伪造**：拒绝大白话总结，强制输出纯英文的终端原生日志格式（Nmap、Gobuster、smbclient 等），并真实还原明文凭据与扫描特征。
+* **攻击链无痕截断**：在情报搜集阶段精准截断，保留推演悬念，绝不泄露后续的漏洞利用与提权步骤。
+
+**训练闭环**
+
+* **推演作答 + AI 批阅**：以资深考官视角结合终端日志与预期攻击链评分，明确指出遗漏的核心知识点。
+* **SM-2 间隔重复复盘**：卡片式作答与三档自评（不会 / 模糊 / 掌握），按答题质量自动调度复习间隔，攻克薄弱考点。
+* **错题本**：一键收藏答错或薄弱的题目，随时回顾考官评语，支持导出 Markdown 离线复习。
+* **统计与排行榜**：按 Domain / Tag 维度输出得分趋势以定位短板，支持多维度筛选；全平台排行榜适合团队共同训练。
+
+**使用与部署**
+
+* **批量生成靶机**：命令行与网页上传均支持多线程并发，可灵活控制编译目标、变种数与线程数。
+* **代号隔离（可选口令）**：默认按代号隔离、零门槛即用；需要更强隔离时，为该代号设置访问口令即可开启保护。
+* **可离线运行**：前端框架本地化并锁定版本，无外网也能打开与操作。
 
 ### 快速开始
 
 本项目自带一个包含示例靶机的 `paperlab.db`，三步即可上手：
+
+> 该示例库为演示数据，含 53 台靶机，不含任何用户战报 / 错题本 / 复习进度。
+> 用 `build.py` 添加自己的笔记时，这 16 台已编译的母体会被自动跳过，不会重复生成。
 
 #### 第一步：安装依赖
 
@@ -67,7 +75,9 @@ python -m pip install -r requirements.txt
 
 #### 第二步：初始化配置
 
-运行安装向导，按提示填入 API Key、选择模型和服务端点（支持 DeepSeek / OpenAI / 自定义）：
+运行安装向导：填入 API Key、选择服务端点，向导会**列出该端点当前可用的模型**供你选择
+（内置 DeepSeek / OpenAI / 智谱 GLM / xAI Grok / Anthropic Claude，也可自定义端点；
+列不到时可手动输入模型名）：
 
 ```cmd
 python setup.py
@@ -78,10 +88,14 @@ python setup.py
 #### 第三步：启动服务
 
 ```cmd
-uvicorn main:app --reload
+python main.py
 ```
 
-随后在浏览器中访问 `http://127.0.0.1:8000`，输入任意 Nick Name 代号即可接入推演终端。
+随后在浏览器中访问 `http://127.0.0.1:8000`，输入任意代号即可接入推演终端。
+
+> 需要**开发热重载**或**局域网共享**时，改用 uvicorn 自行传参：
+> `uvicorn main:app --reload`、`uvicorn main:app --host 0.0.0.0`
+> （局域网共享还需设置 `PAPERLAB_ORIGINS`，见下方「环境变量」）。
 
 ---
 
@@ -122,6 +136,7 @@ $ python build.py
     --workers <N>             并发线程数，建议不超过 5（默认: 3）
     --max-sources <N>         最多处理的源机器数量（默认: 50）
     --quality                 启用质量过滤，额外消耗一次 LLM 调用
+    --force                   忽略「已编译」记录，强制重新编译
     -h, --help                显示帮助信息
 
   示例:
@@ -129,6 +144,7 @@ $ python build.py
     python build.py --target HTB-Lame HTB-Blue            # 只编译指定靶机
     python build.py --derive 5 --workers 5 --quality      # 5 线程 + 质量过滤
     python build.py --max-sources 10 --derive 2           # 最多 10 台，每台 2 变种
+    python build.py --force --target HTB-Lame             # 强制重编译某台
 ```
 
 **方式二：前端在线上传**
@@ -146,19 +162,39 @@ PaperLab-1.0/
 ├── lab_generator.py  # 共用 LLM 生成逻辑（build.py 与 main.py 共享）
 ├── setup.py          # 首次部署配置向导
 ├── index.html        # 前端单页应用
+├── static/           # 本地静态资源（已本地化并锁版本的 Vue）
 ├── requirements.txt  # Python 依赖
 ├── paperlab.db       # SQLite 数据库（靶机库 + 战报 + 错题本）
 ├── config.json       # 本地配置（API Key，由 setup.py 生成）
+├── LICENSE           # Apache License 2.0
 └── md/               # 渗透测试 Markdown 笔记目录（编译原料）
 ```
 
 ---
 
-### 开源协议与商业声明
+### 环境变量
 
-本项目由 `cxtw1t` 独立开发并维护。核心 Prompt 工程与重试机制逻辑未经授权严禁商用。
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `PAPERLAB_ORIGINS` | `http://127.0.0.1:8000,http://localhost:8000` | 允许跨域的来源。局域网共享时需显式声明，例如 `http://192.168.1.10:8000` |
+| `PAPERLAB_ENABLE_DOCS` | `0` | 设为 `1` 打开 `/docs` 与 `/openapi.json` 接口文档 |
+| `PAPERLAB_DB` | `paperlab.db` | 自定义数据库路径 |
 
-本项目基于 **[GPLv3 License](https://www.google.com/search?q=LICENSE)** 开源。
+---
+
+### 代号隔离
+
+默认情况下，输入任意代号即可接入，代号之间按名字隔离数据 —— 适合个人使用或小团队共享。
+
+如果某个代号需要更强隔离，**在登录时给它填一个口令即可开启保护**（首次填入即生效）；之后再用该代号接入就必须提供正确口令。填口令的人请自行记好：服务端只存哈希，无法找回。
+
+> 提示：口令仅保存在浏览器会话中（`sessionStorage`），关闭浏览器后需要重新输入。
+
+---
+
+### 开源协议
+
+本项目基于 **[Apache License 2.0](./LICENSE)** 开源，由 `tw1t` 独立开发并维护。
 
 ### 鸣谢与免责声明
 
