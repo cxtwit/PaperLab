@@ -11,6 +11,7 @@ import sqlite3
 import asyncio
 import hashlib
 import functools
+import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 from urllib.parse import quote
@@ -141,6 +142,14 @@ def _lookup_pass_hash(name: str) -> Optional[str]:
         return row["pass_hash"] if row else None
     finally:
         conn.close()
+
+
+def _safe_json(raw, default):
+    """历史数据里可能存在非法 JSON，解析失败时降级为默认值而不是抛 500。"""
+    try:
+        return json.loads(raw) if raw else default
+    except (json.JSONDecodeError, TypeError):
+        return default
 
 
 def guard_operator(username: str, provided_pass: Optional[str]) -> str:
@@ -312,14 +321,6 @@ async def get_lab_detail(lab_id: str):
     if not row:
         raise HTTPException(status_code=404, detail="靶机未找到")
 
-    # 历史数据里可能存在非法 JSON，解析失败时降级为默认值而不是 500
-    def _safe_json(raw, default):
-        try:
-            value = json.loads(raw) if raw else default
-            return value
-        except (json.JSONDecodeError, TypeError):
-            return default
-
     return {
         "id": row["id"],
         "os": row["os"],
@@ -441,11 +442,17 @@ async def evaluate_submission(
         if ai_report is None:
             raise HTTPException(status_code=502, detail=grade_error or "AI 判卷失败")
 
+        # 落库时同步算出本次平均分，供排行榜直接 SQL 聚合，无需事后解析 JSON
+        _fb = ai_report.get("question_feedback", []) if isinstance(ai_report, dict) else []
+        _scores = [q["score"] for q in _fb
+                   if isinstance(q, dict) and isinstance(q.get("score"), (int, float))]
+        submission_avg = round(sum(_scores) / len(_scores), 1) if _scores else 0.0
+
         cursor.execute('''
-            INSERT INTO submissions (lab_id, operator_name, student_writeup, report)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO submissions (lab_id, operator_name, student_writeup, report, avg_score)
+            VALUES (?, ?, ?, ?, ?)
         ''', (submission.lab_id, submission.username, student_writeup,
-              json.dumps(ai_report, ensure_ascii=False)))
+              json.dumps(ai_report, ensure_ascii=False), submission_avg))
         conn.commit()
 
         return ai_report
@@ -458,6 +465,82 @@ async def evaluate_submission(
     finally:
         if conn:
             conn.close()
+
+
+
+class HintRequest(BaseModel):
+    lab_id: str
+    question_idx: int
+    username: Optional[str] = None
+
+
+HINT_SYSTEM_PROMPT = """你是 OSCP 考官助手。学生请求提示。
+你的任务：从考点中，为指定题目提炼一个【方向性提示】。
+规则：
+1. 只给方向，绝对不给具体漏洞名/CVE/命令/路径。
+2. 提示必须是中文，1-2 句话，简洁有力。
+3. 可以引导学生思考"应该关注情报的哪一部分"，但不能直接说"漏洞是X"。
+4. 只输出纯文本提示内容，无需 JSON 包裹。"""
+
+
+def _hint_sync(question_text, question_focus, focus_points):
+    """同步生成方向提示；由线程池调用，避免阻塞事件循环。"""
+    user_prompt = (
+        f"题目：{question_text}\n"
+        f"考点（仅供你参考，绝对不能泄露）：{question_focus}\n"
+        f"全局考点：{focus_points}\n\n"
+        "请输出一条对学生的方向性提示："
+    )
+    last_error = "未知错误"
+    for attempt in range(3):
+        try:
+            resp = client.chat.completions.create(
+                model=AI_MODEL,
+                messages=[
+                    {"role": "system", "content": HINT_SYSTEM_PROMPT},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=0.4,
+                max_tokens=200,
+            )
+            return (resp.choices[0].message.content or "").strip(), None
+        except Exception as e:
+            last_error = str(e)
+            if attempt < 2:
+                time.sleep(2 ** attempt)
+    return None, last_error
+
+
+@app.post("/api/hint")
+async def get_hint(req: HintRequest):
+    """为指定题目生成方向提示（只给方向，不泄露答案）。"""
+    if req.username:
+        guard_operator(req.username, None)
+
+    conn = get_db_connection()
+    try:
+        row = conn.execute(
+            "SELECT questions, focus_points FROM labs WHERE id = ?", (req.lab_id,)
+        ).fetchone()
+    finally:
+        conn.close()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="靶机未找到")
+
+    questions = _safe_json(row["questions"], [])
+    if req.question_idx < 0 or req.question_idx >= len(questions):
+        raise HTTPException(status_code=400, detail="题目编号超出范围")
+
+    q = questions[req.question_idx]
+    loop = asyncio.get_running_loop()
+    hint, err = await loop.run_in_executor(
+        None,
+        functools.partial(_hint_sync, q.get("text", ""), q.get("focus", ""), row["focus_points"]),
+    )
+    if hint is None:
+        raise HTTPException(status_code=503, detail=f"提示生成失败：{err}")
+    return {"hint": hint}
 
 
 @app.get("/api/history")
@@ -913,46 +996,77 @@ async def sm2_stats(
 async def get_leaderboard(limit: int = Query(20, ge=1, le=100)):
     """
     全平台排行榜：按平均分降序，平均分相同则按总次数降序。
-    每个用户只统计有效（含 question_feedback）的提交。
+    直接以 SQL 聚合 avg_score 列，避免把全部战报读进内存解析 JSON。
     """
     conn = get_db_connection()
     try:
         rows = conn.execute(
-            "SELECT operator_name, report FROM submissions ORDER BY timestamp ASC"
+            """
+            SELECT operator_name,
+                   ROUND(AVG(avg_score), 1) AS avg_score,
+                   COUNT(*) AS total_submissions
+            FROM submissions
+            WHERE avg_score > 0
+            GROUP BY operator_name
+            ORDER BY avg_score DESC, total_submissions DESC
+            LIMIT ?
+            """,
+            (limit,),
         ).fetchall()
 
-        user_data: dict = {}
-        for row in rows:
-            name = row["operator_name"]
-            try:
-                report = json.loads(row["report"])
-            except (json.JSONDecodeError, TypeError):
-                continue
-            scores = [q["score"] for q in report.get("question_feedback", [])
-                      if isinstance(q.get("score"), (int, float))]
-            if not scores:
-                continue
-            avg = sum(scores) / len(scores)
-            if name not in user_data:
-                user_data[name] = {"total": 0, "score_sum": 0.0}
-            user_data[name]["total"] += 1
-            user_data[name]["score_sum"] += avg
-
         board = []
-        for name, d in user_data.items():
+        for i, row in enumerate(rows, 1):
             board.append({
-                "operator_name": name,
-                "avg_score": round(d["score_sum"] / d["total"], 1),
-                "total_submissions": d["total"],
+                "rank": i,
+                "operator_name": row["operator_name"],
+                "avg_score": row["avg_score"],
+                "total_submissions": row["total_submissions"],
             })
+        return board
 
-        board.sort(key=lambda x: (-x["avg_score"], -x["total_submissions"]))
-        for i, entry in enumerate(board, 1):
-            entry["rank"] = i
-
-        return board[:limit]
     finally:
         conn.close()
+
+
+@app.get("/api/streak")
+async def get_streak(username: str, x_operator_pass: Optional[str] = Header(None, alias="X-Operator-Pass")):
+    """返回用户连续打卡天数（当前连续 / 历史最长）。"""
+    guard_operator(username, x_operator_pass)
+
+    conn = get_db_connection()
+    try:
+        rows = conn.execute(
+            "SELECT DISTINCT date(timestamp, 'localtime') AS day FROM submissions "
+            "WHERE operator_name = ? ORDER BY day DESC",
+            (username,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    days = [r["day"] for r in rows if r["day"]]
+    if not days:
+        return {"streak": 0, "longest": 0, "today": False}
+
+    from datetime import date, timedelta
+    day_set = set(days)
+    today = date.today()
+
+    # 当天或昨天都算作连续起点（当天还没做题时，昨天做了也算连续）
+    check = today if today.isoformat() in day_set else today - timedelta(days=1)
+    streak = 0
+    while check.isoformat() in day_set:
+        streak += 1
+        check -= timedelta(days=1)
+
+    longest = cur = 0
+    prev = None
+    for d in sorted(day_set):
+        cur_d = date.fromisoformat(d)
+        cur = cur + 1 if (prev and (cur_d - prev).days == 1) else 1
+        longest = max(longest, cur)
+        prev = cur_d
+
+    return {"streak": streak, "longest": longest, "today": today.isoformat() in day_set}
 
 
 @app.get("/api/stats")

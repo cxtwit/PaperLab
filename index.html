@@ -3,10 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <title>OSCP 纸上推演训练系统</title>
-    <!-- Vue 本地化并锁版本：渲染框架必须离线可用，勿改回外链 CDN -->
     <script src="/static/vue.global.prod.js"></script>
-    <!-- Tailwind 保留 CDN 但锁定版本（其 CDN 为运行时 JIT，无法简单静态化）。
-         它只负责样式，不可达时页面结构与功能仍然完整。 -->
     <script src="https://cdn.tailwindcss.com/3.4.17"></script>
     <style>
         @import url('https://fonts.loli.net/css2?family=Inter:wght@400;500;600;700&family=Fira+Code:wght@400;500;700&display=swap');
@@ -73,6 +70,7 @@
         /* 统计条形图 */
         .stat-bar { height: 6px; border-radius: 3px; transition: width 0.8s ease; }
 
+
         /* 幽灵终端页脚样式 */
         .cyber-footer {
             margin-top: auto;
@@ -118,20 +116,13 @@
                             <input v-model="tempName" @keyup.enter="login" type="text" class="w-full bg-[#0d1117] border border-[#5cb85c] rounded-md p-3 text-white text-center tracking-widest focus:outline-none focus:ring-1 focus:ring-[#5cb85c]" placeholder="hack3r">
                         </div>
                         <div class="mb-6">
-                            <label class="block text-[#8b949e] text-xs mb-2 font-medium">
-                                访问口令 <span style="color:#5f6a76">(选填 · Optional)</span>
-                            </label>
+                            <label class="block text-[#8b949e] text-xs mb-2 font-medium">访问口令 <span style="color:#5f6a76">(选填 · Optional)</span></label>
                             <input v-model="tempPass" @keyup.enter="login" type="password" autocomplete="new-password" class="w-full bg-[#0d1117] border border-[#30363d] rounded-md p-3 text-white text-center tracking-widest focus:outline-none focus:ring-1 focus:ring-[#5cb85c]" placeholder="留空即无需口令">
-                            <p class="text-[10px] text-[#8b949e] mt-2 leading-relaxed">
-                                代号多人共用时可设口令做隔离：首次为该代号填入的口令即为启用；
-                                留空则任何人都能以该代号进入。
-                            </p>
                         </div>
-                        <button @click="login" :disabled="loggingIn" class="pro-btn w-full py-3 text-sm tracking-wide disabled:opacity-60">
+                        <button @click="login" :disabled="loggingIn" class="pro-btn w-full py-3 mb-8 text-sm tracking-wide disabled:opacity-60">
                             {{ loggingIn ? '正在校验…' : '初始化会话 (Initialize Session)' }}
                         </button>
-                        <p v-if="loginError" class="text-red-400 text-[11px] text-center mt-4">{{ loginError }}</p>
-                        <div class="mt-8"></div>
+                        <p v-if="loginError" class="text-red-400 text-[11px] text-center -mt-4 mb-6">{{ loginError }}</p>
                         <div class="border-t border-[#30363d] pt-6 text-center">
                             <p class="text-[10px] text-[#8b949e] mono uppercase tracking-widest mb-1">SECURE TERMINAL ACCESS</p>
                         </div>
@@ -150,6 +141,13 @@
                             </div>
                             <div class="flex items-center gap-4 mb-1">
                                 <span class="text-xs text-[#8b949e] mono">OP: <span class="text-white font-bold">{{ operatorName }}</span></span>
+                                <!-- Streak 连续打卡 badge -->
+                                <span v-if="streak && streak.streak > 0"
+                                    class="text-[11px] mono px-2 py-0.5 rounded border"
+                                    :class="streak.today ? 'border-[#e3b341]/50 text-[#e3b341] bg-[#e3b341]/5' : 'border-[#30363d] text-[#484f58]'"
+                                    :title="'历史最长: ' + streak.longest + ' 天'">
+                                    🔥 {{ streak.streak }}天
+                                </span>
                                 <button @click="logout" class="text-[11px] px-3 py-1.5 border border-[#30363d] rounded text-[#8b949e] hover:text-white hover:border-[#8b949e] transition">[ 注销 ]</button>
                             </div>
                         </div>
@@ -283,6 +281,44 @@
                                                 <div class="text-[10px] text-[#8b949e] mt-1 mono uppercase">总推演次数</div>
                                             </div>
                                         </div>
+
+                                    <!-- 技能雷达图 -->
+                                    <div v-if="stats.domain_stats.length >= 3" class="mt-4">
+                                        <div class="text-[10px] text-[#8b949e] uppercase tracking-wider mb-3 font-bold">技能雷达图</div>
+                                        <div class="flex justify-center">
+                                            <svg :viewBox="'-130 -120 260 250'" width="100%" style="max-width:260px" xmlns="http://www.w3.org/2000/svg">
+                                                <!-- 背景网格 -->
+                                                <g v-for="level in [0.25, 0.5, 0.75, 1.0]" :key="level">
+                                                    <polygon
+                                                        :points="radarGridPoints(Math.min(stats.domain_stats.length, 7), level, 100)"
+                                                        fill="none" stroke="#30363d" stroke-width="0.8"/>
+                                                </g>
+                                                <!-- 轴线 -->
+                                                <line v-for="(d, i) in radarDomains" :key="'axis-'+i"
+                                                    x1="0" y1="0"
+                                                    :x2="radarPt(i, radarDomains.length, 1, 100).x"
+                                                    :y2="radarPt(i, radarDomains.length, 1, 100).y"
+                                                    stroke="#30363d" stroke-width="0.8"/>
+                                                <!-- 数据面 -->
+                                                <polygon
+                                                    :points="radarDataPoints(radarDomains, 100)"
+                                                    fill="#5cb85c" fill-opacity="0.15" stroke="#5cb85c" stroke-width="1.5"/>
+                                                <!-- 数据点 -->
+                                                <circle v-for="(d, i) in radarDomains" :key="'pt-'+i"
+                                                    :cx="radarPt(i, radarDomains.length, d.avg_score / 10, 100).x"
+                                                    :cy="radarPt(i, radarDomains.length, d.avg_score / 10, 100).y"
+                                                    r="3" fill="#5cb85c"/>
+                                                <!-- 标签 -->
+                                                <text v-for="(d, i) in radarDomains" :key="'lbl-'+i"
+                                                    :x="radarPt(i, radarDomains.length, 1, 118).x"
+                                                    :y="radarPt(i, radarDomains.length, 1, 118).y"
+                                                    text-anchor="middle" dominant-baseline="middle"
+                                                    font-size="7.5" fill="#8b949e">
+                                                    {{ d.domain.length > 10 ? d.domain.split(' ').map(w=>w[0]).join('') : d.domain }}
+                                                </text>
+                                            </svg>
+                                        </div>
+                                    </div>
 
                                         <!-- Domain 薄弱项 -->
                                         <div v-if="stats.domain_stats.length" class="mt-3">
@@ -536,6 +572,11 @@
                                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"></path><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"></path></svg>
                                 分析推演 (Strategy Analysis)
                             </h3>
+                            <!-- 草稿恢复提示 Toast -->
+                            <div v-if="draftRestored"
+                                class="flex items-center gap-2 px-4 py-2 bg-[#1c2a1c] border border-[#5cb85c]/40 rounded text-[11px] text-[#5cb85c] mono mb-2 transition">
+                                ✦ 已恢复上次未提交的草稿
+                            </div>
                             <div class="glass-card p-6 shadow-xl">
                                 <div class="space-y-8">
                                     <div v-for="(q, idx) in currentLab.questions" :key="idx" :id="'task-' + idx" class="p-5 bg-[#0d1117] border border-[#30363d] rounded-lg"
@@ -544,6 +585,18 @@
                                         <div class="text-[11px] text-[#5cb85c] mb-4 mono bg-[#5cb85c]/10 px-3 py-1.5 rounded inline-block">-- FOCUS: {{ q.focus }}</div>
 
                                         <textarea v-model="studentAnswers[idx]" :disabled="report != null" class="w-full h-32 pro-input p-4 text-[13px] leading-relaxed mono resize-y shadow-inner transition-all" :class="report ? 'opacity-50' : ''" placeholder="输入漏洞分析及推演细节..."></textarea>
+
+                                        <!-- 提示按钮区（提交前显示，每题限一次） -->
+                                        <div v-if="!report" class="flex items-center gap-3 mt-2">
+                                            <button v-if="!hints[idx]" @click="fetchHint(idx)"
+                                                :disabled="hintLoading[idx]"
+                                                class="text-[10px] px-2.5 py-1 border border-[#30363d] rounded text-[#484f58] hover:border-[#e3b341] hover:text-[#e3b341] transition mono disabled:opacity-40">
+                                                {{ hintLoading[idx] ? '思考中...' : '▸ 获取提示' }}
+                                            </button>
+                                            <div v-if="hints[idx]" class="flex-1 text-[11px] text-[#e3b341] bg-[#e3b341]/5 border border-[#e3b341]/30 rounded px-3 py-2 leading-relaxed">
+                                                💡 {{ hints[idx] }}
+                                            </div>
+                                        </div>
 
                                         <!-- 报告反馈 -->
                                         <div v-if="report && getFeedback(idx + 1)" class="mt-4 bg-[#161b22] border border-[#30363d] rounded-lg border-l-4 shadow-md fade-in" :class="getFeedback(idx + 1).score >= 7 ? 'border-l-[#5cb85c]' : 'border-l-red-500'">
@@ -659,6 +712,38 @@
                 const historyTotal = ref(0);
                 const historyPage = ref(1);
                 const loading = ref(false);
+
+                // ── 草稿自动保存 ──────────────────────────────────────
+                let draftTimer = null;
+                const DRAFT_KEY = (labId) => `paperlab_draft_${labId}`;
+
+                const saveDraft = (labId, answers) => {
+                    clearTimeout(draftTimer);
+                    draftTimer = setTimeout(() => {
+                        if (answers.some(a => a && a.trim())) {
+                            localStorage.setItem(DRAFT_KEY(labId), JSON.stringify(answers));
+                        }
+                    }, 500);
+                };
+
+                const loadDraft = (labId) => {
+                    try {
+                        const raw = localStorage.getItem(DRAFT_KEY(labId));
+                        return raw ? JSON.parse(raw) : null;
+                    } catch { return null; }
+                };
+
+                const clearDraft = (labId) => {
+                    clearTimeout(draftTimer);
+                    if (labId) localStorage.removeItem(DRAFT_KEY(labId));
+                };
+
+                // 监听答案变化，自动防抖保存草稿
+                watch(studentAnswers, (answers) => {
+                    if (currentLabId.value && answers.length) {
+                        saveDraft(currentLabId.value, answers);
+                    }
+                }, { deep: true });
                 const report = ref(null);
                 const matchError = ref(false);
                 const filter = ref({ os: '', domain: '', difficulty: '', excludeDone: true });
@@ -673,8 +758,62 @@
                 const sm2Answer = ref('');
                 const sm2Loading = ref(false);
                 const sm2Done = ref(false);
+                // 提示系统
+                const hints = ref({});       // { [qIdx]: hintText }
+                const hintLoading = ref({}); // { [qIdx]: bool }
+
+                const fetchHint = async (idx) => {
+                    if (hints.value[idx] || hintLoading.value[idx]) return;
+                    hintLoading.value = { ...hintLoading.value, [idx]: true };
+                    try {
+                        const res = await fetch('/api/hint', {
+                            method: 'POST',
+                            headers: authHeaders({ 'Content-Type': 'application/json' }),
+                            body: JSON.stringify({ lab_id: currentLabId.value, question_idx: idx, username: operatorName.value })
+                        });
+                        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                        const data = await res.json();
+                        hints.value = { ...hints.value, [idx]: data.hint };
+                    } catch(e) {
+                        hints.value = { ...hints.value, [idx]: '提示获取失败，请稍后重试。' };
+                    } finally {
+                        hintLoading.value = { ...hintLoading.value, [idx]: false };
+                    }
+                };
+
+                // 雷达图辅助函数
+                const radarDomains = computed(() => {
+                    if (!stats.value) return [];
+                    // 最多取 7 个 domain，避免标签重叠
+                    return stats.value.domain_stats.slice(0, 7);
+                });
+
+                const radarPt = (i, n, ratio, r) => {
+                    // 从正上方开始，顺时针
+                    const angle = (Math.PI * 2 * i / n) - Math.PI / 2;
+                    return { x: Math.cos(angle) * r * ratio, y: Math.sin(angle) * r * ratio };
+                };
+
+                const radarGridPoints = (n, ratio, r) => {
+                    return Array.from({ length: n }, (_, i) => {
+                        const p = radarPt(i, n, ratio, r);
+                        return `${p.x},${p.y}`;
+                    }).join(' ');
+                };
+
+                const radarDataPoints = (domains, r) => {
+                    return domains.map((d, i) => {
+                        const p = radarPt(i, domains.length, d.avg_score / 10, r);
+                        return `${p.x},${p.y}`;
+                    }).join(' ');
+                };
+
                 // 排行榜
                 const leaderboard = ref(null);
+                // 草稿恢复提示
+                const draftRestored = ref(false);
+                // Streak 连续打卡
+                const streak = ref(null);
                 // 上传裂变
                 const uploadFile = ref(null);
                 const uploadDeriveCount = ref(3);
@@ -762,14 +901,10 @@
                             loginError.value = err.detail || '接入失败，请检查代号与口令。';
                             return;
                         }
-                        const data = await res.json();
                         operatorName.value = name;
                         localStorage.setItem('paperlab_user', name);
                         if (tempPass.value) sessionStorage.setItem('paperlab_pass', tempPass.value);
                         else sessionStorage.removeItem('paperlab_pass');
-                        if (data.mode === 'protected') {
-                            loginError.value = '已为该代号启用口令保护。';
-                        }
                         initSession();
                     } catch (e) {
                         loginError.value = '无法连接服务，请确认后端已启动。';
@@ -777,13 +912,12 @@
                         loggingIn.value = false;
                     }
                 }
-
                 const logout = () => {
                     operatorName.value = '';
                     tempPass.value = '';
                     loginError.value = '';
-                    localStorage.removeItem('paperlab_user');
                     sessionStorage.removeItem('paperlab_pass');
+                    localStorage.removeItem('paperlab_user');
                     historyPage.value = 1;
                     history.value = [];
                     historyTotal.value = 0;
@@ -791,8 +925,10 @@
                 }
                 const backToDashboard = () => {
                     stopTimer();
+                    clearDraft(currentLabId.value);
                     currentLab.value = null; currentLabId.value = null; report.value = null;
                     matchError.value = false; savedBookmarks.value = new Set();
+                    hints.value = {}; hintLoading.value = {};
                     window.scrollTo(0,0);
                 }
 
@@ -822,22 +958,23 @@
                     if(!operatorName.value) return;
                     historyPage.value = 1;
                     try {
-                        const [lRes, hRes, sRes, bRes, sm2sRes, doneRes] = await Promise.all([
+                        const [lRes, hRes, sRes, bRes, sm2sRes, doneRes, strRes] = await Promise.all([
                             fetch('/api/list_labs'),
                             fetch(`/api/history?username=${encodeURIComponent(operatorName.value)}&page=1&page_size=15`, { headers: authHeaders() }),
                             fetch(`/api/stats?username=${encodeURIComponent(operatorName.value)}`, { headers: authHeaders() }),
                             fetch(`/api/bookmarks?username=${encodeURIComponent(operatorName.value)}`, { headers: authHeaders() }),
                             fetch(`/api/sm2/stats?username=${encodeURIComponent(operatorName.value)}`, { headers: authHeaders() }),
                             fetch(`/api/done_labs?username=${encodeURIComponent(operatorName.value)}`, { headers: authHeaders() }),
+                            fetch(`/api/streak?username=${encodeURIComponent(operatorName.value)}`, { headers: authHeaders() }),
                         ]);
-                        for (const r of [hRes, sRes, bRes, sm2sRes, doneRes]) {
+                        for (const r of [hRes, sRes, bRes, sm2sRes, doneRes, strRes]) {
                             if (handleAuthFailure(r)) return;
                         }
-                        labs.value = await lRes.json();
                         try {
                             const fRes = await fetch('/api/filters');
                             if (fRes.ok) filters.value = await fRes.json();
                         } catch (e) { /* 忽略，使用兜底逻辑 */ }
+                        labs.value = await lRes.json();
                         const hData = await hRes.json();
                         history.value = hData.items;
                         historyTotal.value = hData.total;
@@ -845,6 +982,7 @@
                         bookmarks.value = await bRes.json();
                         sm2Stats.value = await sm2sRes.json();
                         doneLabIds.value = new Set(await doneRes.json());
+                        streak.value = await strRes.json();
                     } catch(e) { console.error("API Error", e); }
                 }
 
@@ -853,6 +991,7 @@
                     try {
                         const res = await fetch(`/api/history?username=${encodeURIComponent(operatorName.value)}&page=${historyPage.value}&page_size=15`, { headers: authHeaders() });
                         if (handleAuthFailure(res)) return;
+                        if (!res.ok) throw new Error(`HTTP ${res.status}`);
                         const data = await res.json();
                         history.value = [...history.value, ...data.items];
                     } catch(e) { console.error(e); }
@@ -865,6 +1004,7 @@
                     try {
                         const res = await fetch(`/api/sm2/today?username=${encodeURIComponent(operatorName.value)}`, { headers: authHeaders() });
                         if (handleAuthFailure(res)) return;
+                        if (!res.ok) throw new Error(`HTTP ${res.status}`);
                         sm2Today.value = await res.json();
                         sm2CurrentIdx.value = 0;
                         sm2Answer.value = '';
@@ -917,7 +1057,7 @@
                     formData.append('enable_quality_check', uploadQualityCheck.value);
 
                     try {
-                        const res = await fetch('/api/upload_and_build', { method: 'POST', body: formData });
+                        const res = await fetch('/api/upload_and_build', { method: 'POST', body: formData, headers: authHeaders() });
                         const reader = res.body.getReader();
                         const decoder = new TextDecoder();
                         let buf = '';
@@ -974,13 +1114,24 @@
                 const selectLab = async (id) => {
                     currentLabId.value = id; report.value = null; savedBookmarks.value = new Set();
                     try {
-                        const res = await fetch(`/api/get_lab/${id}`); currentLab.value = await res.json();
-                        studentAnswers.value = new Array(currentLab.value.questions.length).fill("");
+                        const res = await fetch(`/api/get_lab/${id}`, { headers: authHeaders() });
+                        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                        currentLab.value = await res.json();
+                        const blank = new Array(currentLab.value.questions.length).fill("");
+                        // 恢复草稿：有草稿则加载，并 toast 提示
+                        const draft = loadDraft(id);
+                        if (draft && draft.length === blank.length && draft.some(a => a && a.trim())) {
+                            studentAnswers.value = draft;
+                            draftRestored.value = true;
+                            setTimeout(() => draftRestored.value = false, 3000);
+                        } else {
+                            studentAnswers.value = blank;
+                        }
                         window.scrollTo(0,0);
                         if (timedMode.value.enabled) {
                             startTimer(0);
                         }
-                    } catch(e) { alert("Failed to fetch intel."); }
+                    } catch(e) { alert("Failed to fetch intel: " + e.message); }
                 }
 
                 const submitSolution = async () => {
@@ -992,9 +1143,11 @@
                             method: 'POST', headers: authHeaders({ 'Content-Type': 'application/json' }),
                             body: JSON.stringify({ lab_id: currentLabId.value, username: operatorName.value, answers: { "student_writeup": combined } })
                         });
-                        if (handleAuthFailure(res)) return;
-                        report.value = await res.json(); await initSession();
-                        setTimeout(() => document.getElementById('report-anchor').scrollIntoView({ behavior: 'smooth', block: 'start' }), 300);
+                        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                        report.value = await res.json();
+                        clearDraft(currentLabId.value); // 提交成功后清除草稿
+                        await initSession();
+                        setTimeout(() => document.getElementById('report-anchor')?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 300);
                     } catch(e) { alert("AI Evaluation Failed."); } finally { loading.value = false; }
                 }
 
@@ -1040,7 +1193,8 @@
 
                 const loadLeaderboard = async () => {
                     try {
-                        const res = await fetch('/api/leaderboard');
+                        const res = await fetch('/api/leaderboard', { headers: authHeaders() });
+                        if (!res.ok) throw new Error(`HTTP ${res.status}`);
                         leaderboard.value = await res.json();
                     } catch(e) { console.error(e); }
                 }
@@ -1064,6 +1218,11 @@
                     sm2Today, sm2Stats, sm2CurrentIdx, sm2Answer, sm2Loading, sm2Done,
                     leaderboard,
                     uploadFile, uploadDeriveCount, uploadQualityCheck, uploadProgress, uploadLog, uploading,
+                    draftRestored,
+                    historyTotal, loadMoreHistory,
+                    radarDomains, radarPt, radarGridPoints, radarDataPoints,
+                    hints, hintLoading, fetchHint,
+                    streak,
                 }
             }
         }).mount('#app')

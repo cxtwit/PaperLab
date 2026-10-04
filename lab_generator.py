@@ -115,8 +115,26 @@ def ensure_db(db_file=DB_FILE):
             cursor.execute('''CREATE TABLE IF NOT EXISTS submissions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, lab_id TEXT,
                 operator_name TEXT, student_writeup TEXT, report TEXT,
+                avg_score REAL DEFAULT 0,
                 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
             )''')
+            # 存量库补列：老库没有 avg_score，补上后用历史 report 回填，
+            # 使排行榜得以直接 SQL 聚合而无需逐条解析 JSON。
+            _cols = {r[1] for r in cursor.execute("PRAGMA table_info(submissions)")}
+            if "avg_score" not in _cols:
+                cursor.execute("ALTER TABLE submissions ADD COLUMN avg_score REAL DEFAULT 0")
+                _hist = cursor.execute(
+                    "SELECT id, report FROM submissions WHERE report IS NOT NULL"
+                ).fetchall()
+                for _id, _rep in _hist:
+                    try:
+                        _fb = json.loads(_rep).get("question_feedback", [])
+                        _sc = [q["score"] for q in _fb
+                               if isinstance(q.get("score"), (int, float))]
+                        _avg = round(sum(_sc) / len(_sc), 1) if _sc else 0.0
+                    except Exception:
+                        _avg = 0.0
+                    cursor.execute("UPDATE submissions SET avg_score = ? WHERE id = ?", (_avg, _id))
             cursor.execute('''CREATE TABLE IF NOT EXISTS bookmarks (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, operator_name TEXT,
                 lab_id TEXT, question_text TEXT, question_focus TEXT,
@@ -154,6 +172,9 @@ def ensure_db(db_file=DB_FILE):
                 "CREATE INDEX IF NOT EXISTS idx_bookmarks_operator ON bookmarks(operator_name)",
                 "CREATE INDEX IF NOT EXISTS idx_sm2_operator_due ON sm2_schedule(operator_name, next_review)",
                 "CREATE INDEX IF NOT EXISTS idx_labs_source ON labs(source_id)",
+                "CREATE INDEX IF NOT EXISTS idx_labs_os ON labs(os)",
+                "CREATE INDEX IF NOT EXISTS idx_labs_domain ON labs(domain)",
+                "CREATE INDEX IF NOT EXISTS idx_labs_difficulty ON labs(difficulty)",
             ):
                 cursor.execute(stmt)
 
