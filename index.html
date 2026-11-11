@@ -244,14 +244,33 @@
                             <div class="md:col-span-5 lg:col-span-4 glass-card p-6 shadow-2xl flex flex-col" style="min-height:400px; max-height:620px;">
                                 <!-- Tab 切换 -->
                                 <div class="flex gap-1 mb-4 border-b border-[#30363d] pb-3">
-                                    <button v-for="tab in ['history','stats','bookmarks','sm2','leaderboard','upload']" :key="tab"
+                                    <button v-for="tab in ['history','stats','bookmarks','sm2','leaderboard','upload','account']" :key="tab"
                                         @click="dashTab = tab"
                                         class="tab-btn" :class="dashTab === tab ? 'active' : ''">
-                                        {{ tab === 'history' ? '战报' : tab === 'stats' ? '统计' : tab === 'bookmarks' ? '错题本' : tab === 'sm2' ? '复盘' : tab === 'leaderboard' ? '排行榜' : '上传' }}
+                                        {{ tab === 'history' ? '战报' : tab === 'stats' ? '统计' : tab === 'bookmarks' ? '错题本' : tab === 'sm2' ? '复盘' : tab === 'leaderboard' ? '排行榜' : tab === 'upload' ? '上传' : '账号' }}
                                     </button>
                                 </div>
 
                                 <!-- 历史战报 -->
+<!-- 账号（代号口令）-->
+                                <div v-if="dashTab === 'account'" class="flex-1 overflow-y-auto custom-scroll space-y-4">
+                                    <div class="bg-[#0d1117] border border-[#30363d] rounded-lg p-4 space-y-3">
+                                        <div class="text-[10px] text-[#8b949e] uppercase tracking-wider font-bold">代号口令</div>
+                                        <div class="text-[11px] text-[#8b949e] leading-relaxed">
+                                            当前代号 <span class="text-white mono">{{ operatorName }}</span>，
+                                            状态：<span :class="operatorProtected ? 'text-[#5cb85c]' : 'text-[#8b949e]'">{{ operatorProtected ? '已启用口令保护' : '未设口令，任何知道代号的人都能用' }}</span>
+                                        </div>
+                                        <div class="text-[10px] text-[#8b949e]">设置后，用这个代号登录必须先输入口令。留空并保存 = 取消保护。</div>
+                                        <div v-if="operatorProtected" class="flex gap-2 items-center">
+                                            <input v-model="pwdCurrent" type="password" autocomplete="off" placeholder="当前口令" class="pro-input text-[11px] px-2 py-1.5 flex-1">
+                                        </div>
+                                        <div class="flex gap-2 items-center">
+                                            <input v-model="pwdNew" type="password" autocomplete="new-password" placeholder="新口令（至少 4 位，留空=取消保护）" class="pro-input text-[11px] px-2 py-1.5 flex-1">
+                                            <button @click="saveOperatorPassword" :disabled="pwdBusy" class="pro-btn px-3 py-1.5 text-[11px] disabled:opacity-60">{{ pwdBusy ? '保存中…' : '保存' }}</button>
+                                        </div>
+                                        <div v-if="pwdMsg" class="text-[11px]" :class="pwdErr ? 'text-red-400' : 'text-[#5cb85c]'">{{ pwdMsg }}</div>
+                                    </div>
+                                </div>
                                 <div v-if="dashTab === 'history'" class="flex-1 overflow-y-auto space-y-3 custom-scroll">
                                     <div v-for="item in history" :key="item.id" class="p-3 bg-[#0d1117] border border-[#30363d] rounded flex flex-col gap-1 hover:border-[#8b949e] transition">
                                         <div class="flex justify-between items-center">
@@ -274,6 +293,22 @@
 
                                 <!-- 统计面板 -->
                                 <div v-else-if="dashTab === 'stats'" class="flex-1 overflow-y-auto custom-scroll space-y-4">
+<!-- 学习路径 -->
+                                      <div v-if="learningPath" class="bg-[#0d1117] border border-[#30363d] rounded-lg p-4">
+                                          <div class="text-[10px] text-[#8b949e] uppercase tracking-wider mb-3 font-bold">学习路径</div>
+                                          <div class="space-y-2.5">
+                                              <div v-for="st in learningPath.stages" :key="st.key" class="flex items-center gap-3">
+                                                  <span class="text-[11px] w-40 shrink-0" :class="st.status === 'mastered' ? 'text-[#5cb85c]' : st.status === 'weak' ? 'text-red-400' : 'text-[#8b949e]'">{{ st.name }}</span>
+                                                  <span class="flex-1 h-1.5 bg-[#21262d] rounded-full overflow-hidden">
+                                                      <span class="block h-full rounded-full" :class="st.status === 'mastered' ? 'bg-[#5cb85c]' : st.status === 'weak' ? 'bg-red-400' : 'bg-[#e3b341]'" :style="{ width: ((st.mastery || 0) * 100) + '%' }"></span>
+                                                  </span>
+                                                  <span class="text-[10px] w-14 text-right mono text-[#8b949e]">{{ st.mastery === null ? '未开始' : Math.round(st.mastery * 100) + '%' }}</span>
+                                              </div>
+                                          </div>
+                                          <div v-if="learningPath.actions && learningPath.actions.length" class="mt-3 pt-3 border-t border-[#21262d] space-y-1">
+                                              <div v-for="(a, i) in learningPath.actions" :key="i" class="text-[11px] text-[#c9d1d9] leading-relaxed">· {{ a }}</div>
+                                          </div>
+                                      </div>
                                     <div v-if="!stats" class="flex items-center justify-center pt-10 text-xs text-[#8b949e] opacity-50">加载中...</div>
                                     <div v-else-if="stats.total === 0" class="flex items-center justify-center pt-10 text-xs text-[#8b949e] opacity-50">暂无统计数据</div>
                                     <div v-else>
@@ -291,7 +326,17 @@
 
                                     <!-- 技能雷达图 -->
                                     <div v-if="stats.domain_stats.length >= 3" class="mt-4">
-                                        <div class="text-[10px] text-[#8b949e] uppercase tracking-wider mb-3 font-bold">技能雷达图</div>
+                                        <!-- 生成成本 -->
+                                      <div v-if="genStats && genStats.total > 0" class="bg-[#0d1117] border border-[#30363d] rounded-lg p-4">
+                                          <div class="text-[10px] text-[#8b949e] uppercase tracking-wider mb-3 font-bold">生成成本</div>
+                                          <div class="grid grid-cols-4 gap-2 text-center">
+                                              <div><div class="text-lg font-bold text-white">{{ genStats.total }}</div><div class="text-[9px] text-[#8b949e] mono">总生成</div></div>
+                                              <div><div class="text-lg font-bold text-white">{{ Math.round(genStats.success_rate * 100) }}%</div><div class="text-[9px] text-[#8b949e] mono">成功率</div></div>
+                                              <div><div class="text-lg font-bold text-white">{{ (genStats.avg_elapsed_ms / 1000).toFixed(1) }}s</div><div class="text-[9px] text-[#8b949e] mono">平均耗时</div></div>
+                                              <div><div class="text-lg font-bold text-white">{{ (genStats.total_tokens / 1000).toFixed(0) }}k</div><div class="text-[9px] text-[#8b949e] mono">总 token</div></div>
+                                          </div>
+                                      </div>
+<div class="text-[10px] text-[#8b949e] uppercase tracking-wider mb-3 font-bold">技能雷达图</div>
                                         <div class="flex justify-center">
                                             <svg :viewBox="'-130 -120 260 250'" width="100%" style="max-width:260px" xmlns="http://www.w3.org/2000/svg">
                                                 <!-- 背景网格 -->
@@ -756,6 +801,40 @@
                 const filter = ref({ os: '', domain: '', difficulty: '', excludeDone: true });
                 const dashTab = ref('history');
                 const stats = ref(null);
+const learningPath = ref(null);
+                const genStats = ref(null);
+                const operatorProtected = ref(false);
+                const pwdCurrent = ref('');
+                const pwdNew = ref('');
+                const pwdBusy = ref(false);
+                const pwdMsg = ref('');
+                const pwdErr = ref(false);
+                const saveOperatorPassword = async () => {
+                    pwdBusy.value = true; pwdMsg.value = ''; pwdErr.value = false;
+                    try {
+                        const res = await fetch('/api/operator/password', {
+                            method: 'POST',
+                            headers: authHeaders({ 'Content-Type': 'application/json' }),
+                            body: JSON.stringify({
+                                username: operatorName.value,
+                                current_password: pwdCurrent.value || null,
+                                new_password: pwdNew.value || null,
+                            }),
+                        });
+                        let d = {};
+                        try { d = await res.json(); } catch (_) {}
+                        if (!res.ok) {
+                            pwdErr.value = true;
+                            pwdMsg.value = d.detail || ('保存失败（HTTP ' + res.status + '）');
+                        } else {
+                            operatorProtected.value = !!d.protected;
+                            pwdCurrent.value = ''; pwdNew.value = '';
+                            pwdMsg.value = d.protected ? '已设置口令，下次登录需要输入它' : '已取消口令保护';
+                        }
+                    } catch (e) {
+                        pwdErr.value = true; pwdMsg.value = '保存失败：' + e.message;
+                    } finally { pwdBusy.value = false; }
+                };
                 const bookmarks = ref([]);
                 const savedBookmarks = ref(new Set());
                 // SM-2 复盘
@@ -986,6 +1065,12 @@
                         history.value = hData.items;
                         historyTotal.value = hData.total;
                         stats.value = await sRes.json();
+try {
+                            const lpRes = await fetch(`/api/learning_path?username=${encodeURIComponent(operatorName.value)}`, { headers: authHeaders() });
+                            if (lpRes.ok) learningPath.value = await lpRes.json();
+                            const gsRes = await fetch('/api/generation_stats', { headers: authHeaders() });
+                            if (gsRes.ok) genStats.value = await gsRes.json();
+                        } catch (_) { /* 这两个卡片失败不影响主面板 */ }
                         bookmarks.value = await bRes.json();
                         sm2Stats.value = await sm2sRes.json();
                         doneLabIds.value = new Set(await doneRes.json());
