@@ -7,12 +7,15 @@
 # Copyright 2026 tw1t
 # SPDX-License-Identifier: Apache-2.0
 import json
+
+from paperlab import attack_graph as _chain
 import os
 import re
 import sys
 import time
 import uuid
 import random
+import shutil
 import sqlite3
 import threading
 
@@ -20,7 +23,12 @@ import threading
 # 0. 全局常量与配置
 # ==========================================
 
-DB_FILE = os.environ.get("PAPERLAB_DB", "paperlab.db")
+# 运行库与演示库分开：
+# - 仓库里跟踪的 paperlab.db 是"演示题库"（开箱即用的样例），只读性质；
+# - 实际运行（作答、错题本、SM-2、批量编译）写到 data/paperlab.db，不进 git。
+# 以前两者是同一个文件，跑一次服务就会把用户自己的作答记录写进版本控制。
+DB_FILE = os.environ.get("PAPERLAB_DB", os.path.join("data", "paperlab.db"))
+DEMO_DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "paperlab.db")
 CONFIG_FILE = "config.json"
 
 # 写库串行锁：SQLite 并发写同一文件会抛 "database is locked" /
@@ -99,10 +107,44 @@ def _migrate_schema(conn):
     # 跳过已编译母体时以它为主判据 —— build_history 在历史库中可能为空。
     if "labs" in _table_names(conn) and "source_id" not in _column_names(conn, "labs"):
         conn.execute("ALTER TABLE labs ADD COLUMN source_id TEXT")
+    # labs.quality_status：'ok' / 'unverified'。
+    # 以前质量评分**调用失败**时返回 10 分，等于"审核失败自动放行" ——
+    # 批量编译时 API 抖动一次，所有没真正审核过的稿子都会被当成好稿入库，
+    # 而使用者以为它们通过了质检。现在失败落成 unverified，可人工复核。
+    if "labs" in _table_names(conn) and "quality_status" not in _column_names(conn, "labs"):
+        conn.execute("ALTER TABLE labs ADD COLUMN quality_status TEXT DEFAULT 'ok'")
+    # labs.attack_chain：结构化攻击链（JSON）。**这是答案键**，
+    # 与 focus_points 同级，绝不能出现在任何学生可见的接口里。
+    if "labs" in _table_names(conn) and "attack_chain" not in _column_names(conn, "labs"):
+        conn.execute("ALTER TABLE labs ADD COLUMN attack_chain TEXT")
+
+
+def _seed_runtime_db(db_file):
+    """
+    运行库还不存在时，用仓库附带的演示库复制一份作为起点。
+
+    为什么不直接把演示库当运行库用：那样跑一次服务就会把作答记录、
+    错题本写进 git 跟踪的文件里（真的发生过 —— paperlab.db 一直是脏的）。
+    现在演示库只当种子，用户数据落在 data/ 下。
+    """
+    if os.path.abspath(db_file) == os.path.abspath(DEMO_DB):
+        return
+    if os.path.exists(db_file):
+        return
+    if not os.path.exists(DEMO_DB):
+        return
+    parent = os.path.dirname(db_file)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    shutil.copy2(DEMO_DB, db_file)
+    print(f"[db] 已从演示库初始化运行库：{db_file}（用户数据不会写进 git）")
 
 
 def ensure_db(db_file=DB_FILE):
     """确保所有表都已创建，并补齐索引与增量迁移。"""
+    # 只在用默认运行库时播种；显式传入的路径（测试、临时库）保持原样。
+    if db_file == DB_FILE:
+        _seed_runtime_db(db_file)
     with _DB_WRITE_LOCK:
         conn = sqlite3.connect(db_file, timeout=30)
         try:
@@ -110,7 +152,8 @@ def ensure_db(db_file=DB_FILE):
             cursor = conn.cursor()
             cursor.execute('''CREATE TABLE IF NOT EXISTS labs (
                 id TEXT PRIMARY KEY, os TEXT, difficulty TEXT, domain TEXT,
-                tags TEXT, context TEXT, questions TEXT, focus_points TEXT
+                tags TEXT, context TEXT, questions TEXT, focus_points TEXT,
+                quality_status TEXT DEFAULT 'ok', attack_chain TEXT
             )''')
             cursor.execute('''CREATE TABLE IF NOT EXISTS submissions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, lab_id TEXT,
@@ -135,6 +178,15 @@ def ensure_db(db_file=DB_FILE):
                     except Exception:
                         _avg = 0.0
                     cursor.execute("UPDATE submissions SET avg_score = ? WHERE id = ?", (_avg, _id))
+            cursor.execute('''CREATE TABLE IF NOT EXISTS generation_stats (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts DATETIME DEFAULT CURRENT_TIMESTAMP,
+                original_id TEXT, variant_idx INTEGER,
+                model TEXT, prompt_tokens INTEGER, completion_tokens INTEGER,
+                elapsed_ms INTEGER, attempts INTEGER,
+                quality_score INTEGER, chain_ok INTEGER,
+                status TEXT, reason TEXT
+            )''')
             cursor.execute('''CREATE TABLE IF NOT EXISTS bookmarks (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, operator_name TEXT,
                 lab_id TEXT, question_text TEXT, question_focus TEXT,
@@ -410,8 +462,8 @@ def save_lab_to_db(history_id, data, db_file=DB_FILE, source_id=None):
             cursor = conn.cursor()
             cursor.execute(
                 '''INSERT OR REPLACE INTO labs
-                   (id, os, difficulty, domain, tags, context, questions, focus_points, source_id)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                   (id, os, difficulty, domain, tags, context, questions, focus_points, source_id, quality_status, attack_chain)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
                 (
                     new_machine_name,
                     data.get('os', 'Unknown'),
@@ -422,6 +474,8 @@ def save_lab_to_db(history_id, data, db_file=DB_FILE, source_id=None):
                     json.dumps(data['questions'], ensure_ascii=False),
                     data['focus_points'],
                     source_id,
+                    data.get('quality_status', 'ok'),
+                    json.dumps(data.get('attack_chain') or [], ensure_ascii=False),
                 )
             )
             cursor.execute(
@@ -550,6 +604,24 @@ def build_mutation_prompt(wp_text, mutation_angle, used_names_list, difficulty_h
     - ⚠️ 最后一个问题必须固定为开放性问题，询问成功获取立足点后的【后续渗透思路或提权推演】。
     - ⚠️ JSON转义致命警告：在伪造 context 字段的终端日志时，如果包含双引号 (")、反斜杠 (\\，如 Windows 路径或正则)、换行符等特殊字符，【必须】严格遵循 JSON 规范进行转义（如写成 \\", \\\\, \\n）。绝不允许输出破坏 JSON 结构的未闭合字符串！
 
+    7. ⛓️ 攻击链结构化 (attack_chain - 强制)：
+       - 除 focus_points 外，还必须输出 `attack_chain` 数组，把"拿到 root/SYSTEM 的完整路径"
+         拆成有序节点。这是给质检与人工复核用的**答案键**，学生永远看不到。
+       - 每个节点必须包含且只包含这五个字段：
+           stage          阶段，只能取：recon | vuln_discovery | initial_access |
+                          cred_discovery | lateral | privilege_escalation
+           hypothesis     这一步要验证的假设（一句话）
+           evidence       ⚠️ **必须是 context 日志里原样出现的片段**（不要改写、不要总结）。
+                          系统会拿它去日志里做词匹配，编造的片段会被判为幻觉。
+           action         对应动作（如何验证这个假设）
+           expected_result 预期结果
+       - 节点顺序必须与因果顺序一致：侦察 → 漏洞发现 → 初始访问 → 凭证发现 → 横向 → 提权。
+         **不允许倒退**（不能提权之后又回头侦察）。
+       - `recon` / `initial_access` / `privilege_escalation` 三个阶段**必须出现**。
+       - 只写 context 里已出现的信息所支撑的步骤：日志截断在"拿到立足点"之前，
+         所以 privilege_escalation 节点的 evidence 也必须引用日志中出现过的线索
+         （提权所依赖的文件/服务/版本，必须在枚举日志里出现过）。
+
     # JSON Output Structure (严格模仿此格式的结尾和提问方式)
     {{
         "machine_name": "Phantom",
@@ -557,13 +629,27 @@ def build_mutation_prompt(wp_text, mutation_angle, used_names_list, difficulty_h
         "difficulty": "Medium",
         "domain": "Active Directory",
         "tags": ["SMB", "Information Leak"],
-        "context": "## 01. NETWORK RECONNAISSANCE\\nStarting Nmap 7.92...\\nNmap scan report for 10.10.11.23\\n(全英文逼真伪造日志)\\n\\n## 02. SERVICE ENUMERATION\\nsmb: \\\\> get pass.txt\\ngetting file \\\\pass.txt\\nAdminBackup: Fall2024!@#",
+        "context": "## 01. NETWORK RECONNAISSANCE\\nStarting Nmap 7.92\\nNmap scan report for 10.10.11.23\\nPORT     STATE SERVICE\\n22/tcp   open  ssh\\n445/tcp  open  microsoft-ds\\n\\n## 02. SMB ENUMERATION\\nsmbclient //10.10.11.23/backups\\nsmb: /backups > ls\\n  pass.txt\\n  sudoers.bak\\nsmb: /backups > get pass.txt\\ngetting file pass.txt\\nAdminBackup: Fall2024!@#\\nsmb: /backups > get sudoers.bak\\ngetting file sudoers.bak\\nadmin ALL=(ALL) NOPASSWD: /usr/bin/python3",
         "questions": [
             {{ "text": "基于 SMB 获取到的 pass.txt，下一步该如何利用此凭证？", "focus": "考察凭证重用与横向移动。" }},
-            {{ "text": "在 XXX 服务中发现的特征...，可能存在哪种注入风险？", "focus": "考察对未知接口的测试思路。" }},
+            {{ "text": "sudoers.bak 暴露的规则意味着什么，能否据此推演出提权路径？", "focus": "考察对 sudo 配置缺陷的识别。" }},
             {{ "text": "结合目前掌握的所有情报，请简述成功获取初始立足点后的后续渗透或提权推演思路？", "focus": "考察系统权限提升和后渗透大局观。" }}
         ],
-        "focus_points": "1. 预期第一步利用链：使用密码尝试登录...\\n2. 预期第二步利用链：利用接口漏洞...\\n3. 预期的后续提权思路：获取低权限后寻找内核漏洞..."
+        "focus_points": "1. 预期第一步利用链：用 AdminBackup 凭证登录...\\n2. 预期第二步利用链：sudoers.bak 中的 NOPASSWD 规则...\\n3. 预期的后续提权思路：python3 逃逸获得 root...",
+        "attack_chain": [
+            {{ "stage": "recon", "hypothesis": "445 端口开放且运行 SMB，备份共享可能可读",
+              "evidence": "445/tcp  open  microsoft-ds",
+              "action": "匿名连接并列举 //10.10.11.23/backups",
+              "expected_result": "看到 pass.txt 与 sudoers.bak" }},
+            {{ "stage": "initial_access", "hypothesis": "备份里的凭证明文可复用",
+              "evidence": "AdminBackup: Fall2024!@#",
+              "action": "用该凭证尝试 SSH 登录",
+              "expected_result": "获得 admin 低权限 shell" }},
+            {{ "stage": "privilege_escalation", "hypothesis": "备份中的 sudoers 规则允许无密码提权",
+              "evidence": "admin ALL=(ALL) NOPASSWD: /usr/bin/python3",
+              "action": "以 python3 执行 os.system 逃逸",
+              "expected_result": "获得 root" }}
+        ]
     }}
     """
     return system_prompt
@@ -582,6 +668,90 @@ def clean_and_parse_json(raw_json_str):
     """清洗 LLM 返回的 JSON 字符串中的脏字符，然后解析"""
     clean = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', '', raw_json_str)
     return json.loads(clean, strict=False)
+
+
+# 攻击链校验的薄封装（保持调用处可读，也方便测试里替换）
+summarize_chain = _chain.summarize
+has_chain_errors = _chain.has_errors
+
+
+def validate_chain(chain, context, questions=None):
+    return _chain.validate_chain(chain, context, questions)
+
+
+# ==========================================
+# 5.5 生成成本统计
+# ==========================================
+# 为什么要有这张表：审查报告指出"平均单台生成成本"这类数字不能拿示例数据顶，
+# 必须真实采集。而生成流程原本**完全没有记录 usage** —— 花了多少 token 无从得知。
+#
+# 记录粒度是"每变种一行"，成功和失败都记（失败那次也是真实调用，也花了钱）。
+
+
+def record_generation(original_id, variant_idx, model, prompt_tokens,
+                      completion_tokens, elapsed_ms, attempts,
+                      quality_score=None, chain_ok=None,
+                      status="ok", reason=None, db_file=DB_FILE):
+    """写一条生成记录。线程安全（与其它写库操作共用一个锁）。"""
+    with _DB_WRITE_LOCK:
+        conn = sqlite3.connect(db_file, timeout=30)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute(
+                "INSERT INTO generation_stats"
+                "(original_id, variant_idx, model, prompt_tokens, completion_tokens,"
+                " elapsed_ms, attempts, quality_score, chain_ok, status, reason)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (original_id, variant_idx, model, int(prompt_tokens or 0),
+                 int(completion_tokens or 0), int(elapsed_ms or 0), int(attempts or 0),
+                 quality_score, None if chain_ok is None else int(bool(chain_ok)),
+                 status, reason),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def generation_stats_summary(db_file=DB_FILE):
+    """
+    汇总生成成本与成功率。
+
+    只返回**真实采集**出来的数字；没有记录时各项为 0，
+    token 与耗时也返回 0，而不是编一个"看起来合理"的估值。
+    """
+    conn = sqlite3.connect(db_file, timeout=30)
+    try:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT COUNT(*) AS total,"
+            "       SUM(CASE WHEN status='ok' THEN 1 ELSE 0 END) AS ok,"
+            "       SUM(CASE WHEN status!='ok' THEN 1 ELSE 0 END) AS failed,"
+            "       SUM(prompt_tokens) AS pt, SUM(completion_tokens) AS ct,"
+            "       AVG(elapsed_ms) AS avg_ms, SUM(attempts) AS attempts"
+            " FROM generation_stats"
+        ).fetchone()
+        total = row["total"] or 0
+        ok = row["ok"] or 0
+        by_status = {
+            r["status"]: r["n"]
+            for r in conn.execute(
+                "SELECT status, COUNT(*) AS n FROM generation_stats GROUP BY status"
+            ).fetchall()
+        }
+        return {
+            "total": total,
+            "ok": ok,
+            "failed": row["failed"] or 0,
+            "success_rate": round(ok / total, 3) if total else 0.0,
+            "prompt_tokens": row["pt"] or 0,
+            "completion_tokens": row["ct"] or 0,
+            "total_tokens": (row["pt"] or 0) + (row["ct"] or 0),
+            "avg_elapsed_ms": int(row["avg_ms"] or 0),
+            "total_attempts": row["attempts"] or 0,
+            "by_status": by_status,
+        }
+    finally:
+        conn.close()
 
 
 # ==========================================
@@ -628,8 +798,99 @@ def quality_check(client, model, lab_data):
         result = clean_and_parse_json(resp.choices[0].message.content)
         return result.get("quality_score", 0), result.get("issues", [])
     except Exception as e:
-        print(f"   ⚠️ 质量评分失败，跳过过滤: {e}")
-        return 10, []  # 评分失败时放行
+        # **绝不能返回 10 分**：那是"评分失败 = 满分放行"。
+        # 批量编译时只要 API 抖动一次，所有没真正审核过的稿子都会被当成
+        # 好稿入库。返回 None，让调用方标记成未审核。
+        print(f"   ⚠️ 质量评分不可用（标记为未审核，不按合格放行）: {e}")
+        return None, [f"质量评分不可用: {e}"]
+
+
+# ==========================================
+# 6.5 三阶段审核
+# ==========================================
+# 把原来散在生成流程里的三道检查集中成一个可读的函数。分三段是有道理的：
+#
+#   阶段一 结构审核：JSON 形状、必填字段、题目/考点数量 —— 纯本地
+#   阶段二 逻辑审核：攻击链是否成立（证据可查、阶段不倒退、三阶段齐全）—— 纯本地
+#   阶段三 质量审核：仿真度与训练价值评分 —— 要调模型，计费
+#
+# 前两段不花钱，所以**必须在第三段之前跑**：一份结构就坏或逻辑就假的稿子，
+# 没有资格再花一次模型调用去评价它。
+
+REVIEW_STRUCTURE = "structure"
+REVIEW_LOGIC = "logic"
+REVIEW_QUALITY = "quality"
+
+REVIEW_STAGE_LABELS = {
+    REVIEW_STRUCTURE: "结构审核",
+    REVIEW_LOGIC: "逻辑审核",
+    REVIEW_QUALITY: "质量审核",
+}
+
+
+def _rev_issue(level, stage, code, message):
+    return {"level": level, "stage": stage, "code": code, "message": message}
+
+
+def summarize_review(issues):
+    """把审核问题压成一行人话。"""
+    if not issues:
+        return "审核通过"
+    bad = [i for i in issues if i["level"] == "error"] or issues
+    head = "；".join(
+        f"[{REVIEW_STAGE_LABELS.get(i['stage'], i['stage'])}] {i['message']}" for i in bad[:2]
+    )
+    if len(bad) > 2:
+        head += f"（另有 {len(bad) - 2} 条）"
+    return head
+
+
+def review_lab(client, model, raw_data, enable_quality_check=True):
+    """
+    对一份模型原始产出跑三道审核。
+
+    返回 (lab_data, verdict, issues, meta)：
+      verdict = "ok"         全部通过
+              = "rejected"   有 error，应当判废、不入库
+              = "unverified" 质量评分不可用 —— 不能当合格，但也不该丢掉已付费的产出
+      meta    = {"quality_score": ..., "chain_ok": ...}（给成本统计用）
+    """
+    issues = []
+    meta = {}
+
+    # ---------- 阶段一：结构 ----------
+    lab_data, warnings = normalize_lab_data(raw_data)
+    for w in warnings:
+        issues.append(_rev_issue("warn", REVIEW_STRUCTURE, "normalize", w))
+    if not lab_data.get("context") or not lab_data.get("questions"):
+        issues.append(_rev_issue("error", REVIEW_STRUCTURE, "missing_core",
+                                 "归一后缺少 context 或 questions，判为无效产出"))
+        return lab_data, "rejected", issues, meta
+
+    # ---------- 阶段二：逻辑（攻击链） ----------
+    chain_issues = validate_chain(lab_data.get("attack_chain"),
+                                  lab_data.get("context", ""),
+                                  lab_data.get("questions"))
+    meta["chain_ok"] = not has_chain_errors(chain_issues)
+    for ci in chain_issues:
+        issues.append(_rev_issue(ci["level"], REVIEW_LOGIC, ci["code"], ci["message"]))
+    if has_chain_errors(chain_issues):
+        return lab_data, "rejected", issues, meta
+
+    # ---------- 阶段三：质量（计费，可选） ----------
+    if enable_quality_check:
+        score, q_issues = quality_check(client, model, lab_data)
+        meta["quality_score"] = score
+        if score is None:
+            issues.append(_rev_issue("warn", REVIEW_QUALITY, "unavailable",
+                                     f"质量评分不可用：{'; '.join(q_issues)[:120]}"))
+            return lab_data, "unverified", issues, meta
+        if score < QUALITY_MIN_SCORE:
+            issues.append(_rev_issue("error", REVIEW_QUALITY, "low_score",
+                                     f"质量评分 {score}/10 未达标：{', '.join(q_issues)}"))
+            return lab_data, "rejected", issues, meta
+
+    return lab_data, "ok", issues, meta
 
 
 # ==========================================
@@ -686,7 +947,7 @@ def _explain_llm_error(msg):
 
 
 def _generate_raw_variant(client, model, wp_text, original_id, variant_idx,
-                          used_names, difficulty_hint):
+                          used_names, difficulty_hint, usage_out=None):
     """
     阶段一：调用 LLM 并解析出结构化数据。
 
@@ -712,6 +973,15 @@ def _generate_raw_variant(client, model, wp_text, original_id, variant_idx,
         kwargs.update(_json_mode_arg())
         try:
             response = client.chat.completions.create(**kwargs)
+            # 记录真实用量：成本统计必须来自实际返回，不能拿估算值充数。
+            if usage_out is not None:
+                u = getattr(response, "usage", None)
+                usage_out.update(
+                    model=model,
+                    prompt_tokens=getattr(u, "prompt_tokens", 0) or 0,
+                    completion_tokens=getattr(u, "completion_tokens", 0) or 0,
+                    attempts=attempts + 1,
+                )
             return clean_and_parse_json(response.choices[0].message.content), None
         except json.JSONDecodeError:
             attempts += 1
@@ -727,6 +997,45 @@ def _generate_raw_variant(client, model, wp_text, original_id, variant_idx,
 def generate_single_variant(client, model, wp_text, original_id, variant_idx,
                             global_used_names, db_file=DB_FILE, enable_quality_check=True):
     """
+    生成单个变种靶机（对外入口）。
+
+    这一层只负责**计时与记账**，真正流程在 _generate_single_variant_impl。
+    分开的原因：impl 有多条提前返回的分支（链不合格 / 质检不过 / 写库失败…），
+    在每条 return 前手动记账既啰嗦又必然漏 —— 包一层就漏不了。
+    """
+    started = time.time()
+    usage = {}
+    quality = {}
+    result = _generate_single_variant_impl(
+        client, model, wp_text, original_id, variant_idx,
+        global_used_names, db_file, enable_quality_check, usage, quality
+    )
+    success, new_name, lab_data, error = result
+    try:
+        record_generation(
+            original_id=original_id,
+            variant_idx=variant_idx,
+            model=usage.get("model") or model,
+            prompt_tokens=usage.get("prompt_tokens", 0),
+            completion_tokens=usage.get("completion_tokens", 0),
+            elapsed_ms=int((time.time() - started) * 1000),
+            attempts=usage.get("attempts", 0),
+            quality_score=quality.get("score"),
+            chain_ok=quality.get("chain_ok"),
+            status="ok" if success else "rejected",
+            reason=None if success else (error or "")[:300],
+            db_file=db_file,
+        )
+    except Exception as e:  # 记账失败绝不能影响生成结果
+        print(f"   ⚠️ 生成统计写入失败（不影响结果）: {e}")
+    return result
+
+
+def _generate_single_variant_impl(client, model, wp_text, original_id, variant_idx,
+                                  global_used_names, db_file=DB_FILE,
+                                  enable_quality_check=True,
+                                  usage_out=None, quality_out=None):
+    """
     生成单个变种靶机。供 build.py 和上传 API 共同调用。
 
     返回: (success: bool, machine_name: str | None, lab_data: dict | None, error: str | None)
@@ -741,23 +1050,28 @@ def generate_single_variant(client, model, wp_text, original_id, variant_idx,
     difficulty_hint = get_difficulty_distribution(db_file)
     raw_data, err = _generate_raw_variant(
         client, model, wp_text, original_id, variant_idx,
-        list(global_used_names), difficulty_hint
+        list(global_used_names), difficulty_hint, usage_out
     )
     if raw_data is None:
         return False, None, None, err
 
-    # ---------- 阶段二：归一与校验（本地，零成本） ----------
-    lab_data, warnings = normalize_lab_data(raw_data)
-    if not lab_data.get("context") or not lab_data.get("questions"):
-        return False, None, lab_data, "归一后缺少 context 或 questions，判为无效产出"
-    for w in warnings:
-        print(f"   ℹ️ [{original_id} v{variant_idx}] 归一提示: {w}")
-
-    # ---------- 阶段三：质量评分（可选，计费） ----------
-    if enable_quality_check:
-        score, issues = quality_check(client, model, lab_data)
-        if score < QUALITY_MIN_SCORE:
-            return False, None, lab_data, f"质量评分 {score}/10 未达标: {', '.join(issues)}"
+    # ---------- 阶段二/三：三道审核（结构 → 逻辑 → 质量） ----------
+    # 顺序的理由见 review_lab()：前两段免费，必须在计费的质量审核之前跑。
+    lab_data, verdict, issues, meta = review_lab(
+        client, model, raw_data, enable_quality_check
+    )
+    for i in issues:
+        mark = "⛔" if i["level"] == "error" else "ℹ️"
+        print(f"   {mark} [{original_id} v{variant_idx}] "
+              f"{REVIEW_STAGE_LABELS.get(i['stage'], i['stage'])}: {i['message']}")
+    if quality_out is not None:
+        quality_out["chain_ok"] = meta.get("chain_ok")
+        quality_out["score"] = meta.get("quality_score")
+    if verdict == "rejected":
+        return False, None, lab_data, summarize_review(issues)
+    if verdict == "unverified":
+        # 质量评分不可用：不能当合格放行，但也不该丢掉这次已付费的产出。
+        lab_data["quality_status"] = "unverified"
 
     # ---------- 阶段四：原子占名（本地） ----------
     proposed = lab_data.get("machine_name") or "Phantom"
