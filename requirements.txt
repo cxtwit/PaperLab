@@ -1,5 +1,11 @@
-fastapi>=0.111.0
-uvicorn[standard]>=0.29.0
-pydantic>=2.7.0
-openai>=1.30.0
-python-multipart>=0.0.9
+# 运行时依赖（版本已锁定到实测可用的组合，避免不同环境装出不同版本）
+#
+# 为什么从 ">=" 改成 "=="：之前只写下限，今天装上是 0.111.0，半年后可能装上
+# 0.120.0 —— FastAPI/Starlette 的小版本升级改过中间件行为，出问题时很难回溯。
+# 需要升级时：改这里的版本号 → 跑 pytest → 通过再提交。
+fastapi==0.111.0
+starlette==0.37.2
+uvicorn[standard]==0.46.0
+pydantic==2.13.4
+openai==1.78.0
+python-multipart==0.0.9

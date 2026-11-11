@@ -218,3 +218,13 @@ config.json
 # Claude Code
 .claude/
 CLAUDE.md
+# 运行期数据库（演示库 paperlab.db 只当种子，用户数据写这里）
+data/
+
+# 开发用测试与 CI：不进仓库，运行期用不到
+tests/
+.github/
+requirements-dev.txt
+
+# 开发自查工具：量判卷准确率用，不是客户端功能
+grading_benchmark.py
